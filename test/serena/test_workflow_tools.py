@@ -33,7 +33,6 @@ def test_coding_workflow_tools_are_registered() -> None:
     assert "create_goal" in names
     assert "update_goal" in names
     assert "record_goal_progress" in names
-    assert "summarize_goal_for_new_chat" in names
 
 
 def test_load_instruction_documents_prefers_override_and_preserves_scope_order(tmp_path: Path) -> None:

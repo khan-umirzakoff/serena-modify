@@ -1084,7 +1084,6 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "create_goal",
                 "update_goal",
                 "record_goal_progress",
-                "summarize_goal_for_new_chat",
                 "apply_patch",
                 "prepare_coding_task",
                 "prepare_review_task",
@@ -1361,7 +1360,7 @@ class UpdateGoalTool(Tool):
 
 class RecordGoalProgressTool(Tool):
     """
-    Records Serena-native progress notes for ChatGPT Web/App handoff without changing goal status.
+    Records Serena-native progress notes without changing goal status.
     """
 
     def apply(self, note: str, validation_results: str | None = None, remaining_risks: str | None = None) -> str:
@@ -1390,75 +1389,6 @@ class RecordGoalProgressTool(Tool):
         state["updated_at"] = _utc_now()
         _save_goal_state(project_root, state)
         return json.dumps(_goal_response(_goal_public_state(project_root)), ensure_ascii=False, indent=2)
-
-
-class SummarizeGoalForNewChatTool(Tool):
-    """
-    Creates a compact handoff summary for continuing the current goal in a new ChatGPT conversation.
-    """
-
-    def apply(self, extra_notes: str | None = None) -> str:
-        """
-        Return a compact Markdown handoff summary for a new chat.
-
-        :param extra_notes: optional additional handoff notes
-        :return: Markdown handoff summary
-        """
-        active_project = self.agent.get_active_project_or_raise()
-        project_root = Path(active_project.project_root).resolve()
-        state = _require_goal_state(project_root)
-        public_goal = _goal_public_state(project_root) or state
-        validation_hints = _infer_validation_hints(project_root)
-        git_status = _run_git_snapshot(project_root, ["status", "--short"])
-        git_diff_stat = _run_git_snapshot(project_root, ["diff", "--stat"])
-        progress = public_goal.get("progress", [])
-        if not isinstance(progress, list):
-            progress = []
-
-        progress_lines: list[str] = []
-        for item in progress[-8:]:
-            if isinstance(item, dict):
-                progress_lines.append(f"- {item.get('at', 'unknown')}: {item.get('note', '')}")
-            else:
-                progress_lines.append(f"- {item}")
-        if not progress_lines:
-            progress_lines.append("- No progress notes recorded yet.")
-
-        validation_lines = [f"- `{command}`" for command in validation_hints.likely_commands] or ["- No validation commands inferred."]
-        summary = [
-            "# Serena Goal Handoff",
-            "",
-            f"Project: `{project_root}`",
-            f"Objective: {public_goal.get('objective', '')}",
-            f"Status: {public_goal.get('status', 'unknown')}",
-            f"Time used seconds: {public_goal.get('time_used_seconds', 0)}",
-            f"Token budget: {public_goal.get('token_budget')}",
-            f"Tokens used: {public_goal.get('tokens_used', 0)}",
-            f"Tokens remaining: {public_goal.get('remaining_tokens')}",
-            "",
-            "Recent progress:",
-            *progress_lines,
-            "",
-            "Validation hints:",
-            *validation_lines,
-            "",
-            "Git status:",
-            "```",
-            git_status.output or "(clean)",
-            "```",
-            "",
-            "Git diff stat:",
-            "```",
-            git_diff_stat.output or "(no diff)",
-            "```",
-        ]
-        if public_goal.get("validation_results"):
-            summary.extend(["", f"Validation results: {public_goal['validation_results']}"])
-        if public_goal.get("remaining_risks"):
-            summary.extend(["", f"Remaining risks: {public_goal['remaining_risks']}"])
-        if extra_notes is not None and extra_notes.strip():
-            summary.extend(["", f"Extra notes: {extra_notes.strip()}"])
-        return "\n".join(summary)
 
 
 class OnboardingTool(Tool):

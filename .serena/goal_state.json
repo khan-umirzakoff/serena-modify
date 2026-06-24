@@ -1,0 +1,18 @@
+{
+  "objective": "Smoke-test Serena goal tools after MCP reconnect",
+  "status": "complete",
+  "token_budget": null,
+  "tokens_used": 0,
+  "time_used_seconds": 14,
+  "created_at": "2026-06-24T03:32:02.958250Z",
+  "updated_at": "2026-06-24T03:32:17.431996Z",
+  "progress": [
+    {
+      "at": "2026-06-24T03:32:07.873601Z",
+      "note": "Created a temporary smoke-test goal and verified create_goal works."
+    }
+  ],
+  "validation_results": "create_goal returned active goal state with state_path and runtime prompts.",
+  "remaining_risks": null,
+  "project_root": "/home/khan/PROJECTS/Serena_MCP_mutation/serena"
+}
