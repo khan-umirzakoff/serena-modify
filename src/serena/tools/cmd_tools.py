@@ -567,7 +567,7 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
         :param max_output_tokens: approximate output budget. Defaults to 10000 tokens.
         :param shell: shell binary to use. Defaults to the user's SHELL when available.
         :param login: run the shell with login semantics when supported by the selected shell.
-        :param tty: request a PTY. Serena currently uses pipe transport and reports this in the response.
+        :param tty: request a PTY for interactive commands that need stdin, prompts, REPLs, or console behavior.
         :return: JSON terminal response with output, exit code or session ID, and temp log path
         """
         workdir_path = _resolve_workdir(self.get_project_root(), workdir)
