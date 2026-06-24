@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from serena.tools import Tool, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
+from serena.tools import Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
 
 
 @dataclass(frozen=True)
@@ -298,8 +298,21 @@ def _plan_public_state(project_root: Path) -> dict[str, Any] | None:
 
 
 def _validate_plan(plan: list[dict[str, Any]]) -> None:
+    if not isinstance(plan, list):
+        raise ValueError("plan must be a list of plan items")
+
+    allowed_item_keys = {"step", "status"}
     in_progress_count = 0
+    all_completed = True
+
     for index, item in enumerate(plan):
+        if not isinstance(item, dict):
+            raise ValueError(f"plan item {index} must be an object")
+
+        extra_keys = set(item) - allowed_item_keys
+        if extra_keys:
+            raise ValueError(f"plan item {index} has unsupported fields: {sorted(extra_keys)}")
+
         step = item.get("step")
         status = item.get("status")
         if not isinstance(step, str) or not step.strip():
@@ -308,8 +321,13 @@ def _validate_plan(plan: list[dict[str, Any]]) -> None:
             raise ValueError(f"plan item {index} status must be one of {sorted(PLAN_STATUSES)}")
         if status == "in_progress":
             in_progress_count += 1
+        if status != "completed":
+            all_completed = False
+
     if in_progress_count > 1:
         raise ValueError("at most one plan item can be in_progress")
+    if plan and not all_completed and in_progress_count != 1:
+        raise ValueError("exactly one plan item must be in_progress until all items are completed")
 
 
 def _format_plan_markdown(plan: list[dict[str, Any]]) -> str:
@@ -662,6 +680,305 @@ def _active_serena_state(agent: Any) -> tuple[str, list[str], list[str]]:
     return context, list(mode_names), sorted(agent.get_active_tool_names())
 
 
+APPLY_PATCH_BEGIN = "*** Begin Patch"
+APPLY_PATCH_END = "*** End Patch"
+APPLY_PATCH_ADD = "*** Add File: "
+APPLY_PATCH_DELETE = "*** Delete File: "
+APPLY_PATCH_UPDATE = "*** Update File: "
+APPLY_PATCH_MOVE = "*** Move to: "
+
+
+@dataclass(frozen=True)
+class ApplyPatchChangeSummary:
+    """Summary of a file operation produced by ``apply_patch``."""
+
+    operation: str
+    path: str
+    move_path: str | None = None
+    line_count: int | None = None
+
+
+@dataclass(frozen=True)
+class ApplyPatchResult:
+    """Result returned after parsing and optionally applying a Codex-style patch."""
+
+    success: bool
+    dry_run: bool
+    summary: str
+    changes: list[ApplyPatchChangeSummary]
+    errors: list[str]
+
+
+@dataclass(frozen=True)
+class _ParsedPatchOperation:
+    """Parsed patch operation before filesystem application."""
+
+    operation: str
+    path: str
+    move_path: str | None
+    lines: list[str]
+
+
+def _strip_apply_patch_heredoc(patch: str) -> str:
+    """Normalized patch body with optional heredoc wrapper removed."""
+    lines = patch.strip().splitlines()
+    if len(lines) >= 4 and lines[0] in {"<<EOF", "<<'EOF'", '<<"EOF"'} and lines[-1].endswith("EOF"):
+        return "\n".join(lines[1:-1]).strip()
+    return patch.strip()
+
+
+def _parse_apply_patch_operations(patch: str) -> list[_ParsedPatchOperation]:
+    """Parsed Codex-style patch operations.
+
+    The accepted envelope follows Codex's Add/Delete/Update/Move patch grammar.
+    The parser is intentionally small and strict enough to return actionable
+    errors before any filesystem changes are attempted.
+    """
+    patch = _strip_apply_patch_heredoc(patch)
+    lines = patch.splitlines()
+
+    if not lines or lines[0].strip() != APPLY_PATCH_BEGIN:
+        raise ValueError("The first line of the patch must be '*** Begin Patch'")
+    if lines[-1].strip() != APPLY_PATCH_END:
+        raise ValueError("The last line of the patch must be '*** End Patch'")
+
+    operations: list[_ParsedPatchOperation] = []
+    index = 1
+    while index < len(lines) - 1:
+        line = lines[index]
+        if line.startswith(APPLY_PATCH_ADD):
+            file_path = line.removeprefix(APPLY_PATCH_ADD).strip()
+            index += 1
+            payload: list[str] = []
+            while index < len(lines) - 1 and not lines[index].startswith("*** "):
+                if not lines[index].startswith("+"):
+                    raise ValueError(f"Add File lines must start with '+': {file_path}")
+                payload.append(lines[index][1:])
+                index += 1
+            operations.append(_ParsedPatchOperation("add", file_path, None, payload))
+            continue
+
+        if line.startswith(APPLY_PATCH_DELETE):
+            file_path = line.removeprefix(APPLY_PATCH_DELETE).strip()
+            operations.append(_ParsedPatchOperation("delete", file_path, None, []))
+            index += 1
+            continue
+
+        if line.startswith(APPLY_PATCH_UPDATE):
+            file_path = line.removeprefix(APPLY_PATCH_UPDATE).strip()
+            index += 1
+            move_path: str | None = None
+            if index < len(lines) - 1 and lines[index].startswith(APPLY_PATCH_MOVE):
+                move_path = lines[index].removeprefix(APPLY_PATCH_MOVE).strip()
+                index += 1
+
+            payload = []
+            while (
+                index < len(lines) - 1
+                and not lines[index].startswith("*** Add File: ")
+                and not lines[index].startswith("*** Delete File: ")
+                and not lines[index].startswith("*** Update File: ")
+            ):
+                payload.append(lines[index])
+                index += 1
+            operations.append(_ParsedPatchOperation("update", file_path, move_path, payload))
+            continue
+
+        raise ValueError(f"Unsupported patch header on line {index + 1}: {line}")
+
+    if not operations:
+        raise ValueError("No files were modified.")
+    return operations
+
+
+def _resolve_patch_path(project_root: Path, relative_workdir: str, patch_path: str) -> Path:
+    """Resolved project-local path from a patch file reference."""
+    raw_path = Path(patch_path)
+    if raw_path.is_absolute():
+        raise ValueError(f"Patch paths must be relative, got absolute path: {patch_path}")
+
+    workdir = (project_root / relative_workdir).resolve()
+    candidate = (workdir / raw_path).resolve()
+    if candidate != project_root and project_root not in candidate.parents:
+        raise ValueError(f"Patch path escapes the active project: {patch_path}")
+    return candidate
+
+
+def _relative_patch_path(project_root: Path, path: Path) -> str:
+    """Project-relative path spelling for JSON responses."""
+    return path.relative_to(project_root).as_posix()
+
+
+def _split_patch_update_hunks(lines: list[str]) -> list[list[str]]:
+    """Split an Update File payload into hunk bodies."""
+    hunks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in lines:
+        if line.startswith("@@"):
+            if current is not None:
+                hunks.append(current)
+            current = []
+            continue
+        if line == "*** End of File":
+            continue
+        if current is None:
+            raise ValueError("Update File hunks must start with '@@'")
+        if not line or line[0] not in {" ", "-", "+"}:
+            raise ValueError(f"Invalid hunk line: {line}")
+        current.append(line)
+    if current is not None:
+        hunks.append(current)
+    if not hunks:
+        raise ValueError("Update File operation must contain at least one hunk.")
+    return hunks
+
+
+def _find_unique_subsequence(haystack: list[str], needle: list[str]) -> int:
+    """Unique location of a hunk's old lines inside file content."""
+    if not needle:
+        return len(haystack)
+
+    matches = []
+    limit = len(haystack) - len(needle) + 1
+    for index in range(max(0, limit)):
+        if haystack[index : index + len(needle)] == needle:
+            matches.append(index)
+            if len(matches) > 1:
+                break
+
+    if not matches:
+        raise ValueError("Patch hunk did not match file content.")
+    if len(matches) > 1:
+        raise ValueError("Patch hunk matched multiple locations; add more context.")
+    return matches[0]
+
+
+def _apply_patch_update_text(original: str, payload_lines: list[str]) -> str:
+    """Updated file text after applying parsed Update File hunks."""
+    content = original.splitlines()
+    trailing_newline = original.endswith("\n")
+
+    for hunk in _split_patch_update_hunks(payload_lines):
+        old_lines = [line[1:] for line in hunk if line.startswith((" ", "-"))]
+        new_lines = [line[1:] for line in hunk if line.startswith((" ", "+"))]
+        start = _find_unique_subsequence(content, old_lines)
+        content[start : start + len(old_lines)] = new_lines
+
+    updated = "\n".join(content)
+    if trailing_newline or original == "":
+        updated += "\n"
+    return updated
+
+
+def _apply_parsed_patch_operation(
+    project_root: Path,
+    relative_workdir: str,
+    operation: _ParsedPatchOperation,
+    dry_run: bool,
+) -> ApplyPatchChangeSummary:
+    """Apply one parsed patch operation to the active project filesystem."""
+    target = _resolve_patch_path(project_root, relative_workdir, operation.path)
+    relative_target = _relative_patch_path(project_root, target)
+
+    if operation.operation == "add":
+        if target.exists():
+            raise ValueError(f"Cannot add file that already exists: {relative_target}")
+        content = "\n".join(operation.lines)
+        if operation.lines:
+            content += "\n"
+        if not dry_run:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        return ApplyPatchChangeSummary("add", relative_target, line_count=len(operation.lines))
+
+    if operation.operation == "delete":
+        if not target.exists():
+            raise ValueError(f"Cannot delete missing file: {relative_target}")
+        content = target.read_text(encoding="utf-8")
+        if not dry_run:
+            target.unlink()
+        return ApplyPatchChangeSummary("delete", relative_target, line_count=len(content.splitlines()))
+
+    if operation.operation == "update":
+        if not target.exists():
+            raise ValueError(f"Cannot update missing file: {relative_target}")
+        original = target.read_text(encoding="utf-8")
+        updated = _apply_patch_update_text(original, operation.lines)
+        move_target = None
+        if operation.move_path is not None:
+            move_target = _resolve_patch_path(project_root, relative_workdir, operation.move_path)
+            if move_target.exists() and move_target != target:
+                raise ValueError(f"Cannot move to existing file: {_relative_patch_path(project_root, move_target)}")
+
+        if not dry_run:
+            output_target = move_target or target
+            output_target.parent.mkdir(parents=True, exist_ok=True)
+            output_target.write_text(updated, encoding="utf-8")
+            if move_target is not None and move_target != target:
+                target.unlink()
+
+        return ApplyPatchChangeSummary(
+            "update",
+            relative_target,
+            move_path=_relative_patch_path(project_root, move_target) if move_target is not None else None,
+            line_count=len(updated.splitlines()),
+        )
+
+    raise ValueError(f"Unsupported patch operation: {operation.operation}")
+
+
+def _apply_codex_style_patch(project_root: Path, relative_workdir: str, patch: str, dry_run: bool) -> ApplyPatchResult:
+    """Apply a Codex-style patch and return a bounded structured result."""
+    changes: list[ApplyPatchChangeSummary] = []
+    try:
+        operations = _parse_apply_patch_operations(patch)
+        for operation in operations:
+            changes.append(_apply_parsed_patch_operation(project_root, relative_workdir, operation, dry_run))
+    except Exception as error:
+        return ApplyPatchResult(
+            success=False,
+            dry_run=dry_run,
+            summary=f"patch failed: {error}",
+            changes=changes,
+            errors=[str(error)],
+        )
+
+    return ApplyPatchResult(
+        success=True,
+        dry_run=dry_run,
+        summary=f"patch {'validated' if dry_run else 'applied'}: {len(changes)} file operation(s)",
+        changes=changes,
+        errors=[],
+    )
+
+
+class ApplyPatchTool(Tool, ToolMarkerCanEdit):
+    """
+    Applies Codex-style file patches inside the active project.
+    """
+
+    def apply(self, patch: str, relative_workdir: str = ".", dry_run: bool = False, max_answer_chars: int = -1) -> str:
+        """
+        Apply or validate a Codex-style Add/Delete/Update/Move patch.
+
+        :param patch: patch body enclosed by ``*** Begin Patch`` and ``*** End Patch``
+        :param relative_workdir: project-relative directory used to resolve patch paths
+        :param dry_run: validate and summarize the patch without writing files
+        :param max_answer_chars: maximum JSON response length; ``-1`` uses Serena's default response limit
+        :return: JSON patch result with success, changed files, and errors
+        """
+        active_project = self.agent.get_active_project_or_raise()
+        project_root = Path(active_project.project_root).resolve()
+
+        workdir = _resolve_focus_dir(project_root, relative_workdir)
+        result = _apply_codex_style_patch(project_root, _relative_path(workdir, project_root), patch, dry_run)
+        response = json.dumps(asdict(result), ensure_ascii=False, indent=2)
+
+        if max_answer_chars >= 0:
+            return _truncate_text(response, max_answer_chars)
+        return response
+
+
 class PrepareCodingTaskTool(Tool):
     """
     Prepares a Codex-style coding task snapshot before editing code.
@@ -731,12 +1048,17 @@ class GetCodingHarnessInstructionsTool(Tool):
                     "Use update_plan as a lightweight checklist for meaningful multi-step work. "
                     "It must not switch Serena modes or disable tools; after calling it, briefly reflect the current plan in chat."
                 ),
-                "code_understanding": "Prefer Serena search and symbol tools before editing unfamiliar code.",
-                "edits": "Keep changes scoped. Avoid unrelated rewrites and do not overwrite unknown user edits.",
+                "code_understanding": "Inspect first with Serena search/symbol tools before editing unfamiliar code.",
+                "edits": (
+                    "Keep changes scoped. Prefer apply_patch for Codex-style textual multi-file patches, "
+                    "dry-run patch validation, and small atomic file edits; prefer semantic tools for symbol-aware edits. "
+                    "Reject ambiguous edits and do not overwrite unknown user changes."
+                ),
                 "terminal": (
                     "Use exec_command for commands; set tty=true for interactive stdin/REPL/prompt workflows. "
-                    "Use write_stdin for polling or interacting with running sessions."
+                    "Use write_stdin with terminal_session_id from exec_command.session_id for polling or interacting with running sessions."
                 ),
+                "flow": "Inspect → plan when useful → edit minimally → validate focused → inspect failures → fix task-related issues → finalize.",
                 "output": "Keep command output bounded; use log_path for full logs.",
                 "sessions": "Use list_terminal_sessions and stop_terminal_session to account for or clean up background processes.",
             },
@@ -763,6 +1085,7 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "update_goal",
                 "record_goal_progress",
                 "summarize_goal_for_new_chat",
+                "apply_patch",
                 "prepare_coding_task",
                 "prepare_review_task",
                 "finalize_review_task",

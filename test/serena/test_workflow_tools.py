@@ -3,6 +3,7 @@ from pathlib import Path
 from serena.tools.tools_base import ToolRegistry
 from serena.tools.workflow_tools import (
     MAX_GOAL_OBJECTIVE_CHARS,
+    _apply_codex_style_patch,
     _format_plan_markdown,
     _goal_public_state,
     _goal_response,
@@ -20,6 +21,7 @@ from serena.tools.workflow_tools import (
 def test_coding_workflow_tools_are_registered() -> None:
     names = ToolRegistry().get_tool_names()
 
+    assert "apply_patch" in names
     assert "prepare_coding_task" in names
     assert "get_coding_harness_instructions" in names
     assert "get_validation_commands" in names
@@ -168,6 +170,32 @@ def test_update_plan_validation_matches_codex_shape() -> None:
     else:
         raise AssertionError("Expected multiple in_progress plan items to be rejected")
 
+    try:
+        _validate_plan(
+            [
+                {"step": "one", "status": "completed"},
+                {"step": "two", "status": "pending"},
+            ]
+        )
+    except ValueError as e:
+        assert "exactly one" in str(e)
+    else:
+        raise AssertionError("Expected non-complete plans without in_progress to be rejected")
+
+    try:
+        _validate_plan([{"step": "one", "status": "in_progress", "extra": "unsupported"}])
+    except ValueError as e:
+        assert "unsupported fields" in str(e)
+    else:
+        raise AssertionError("Expected unsupported plan fields to be rejected")
+
+    _validate_plan(
+        [
+            {"step": "one", "status": "completed"},
+            {"step": "two", "status": "completed"},
+        ]
+    )
+
 
 def test_resolve_review_target_uncommitted_and_commit(tmp_path: Path) -> None:
     uncommitted = _resolve_review_target(tmp_path, "uncommitted", None, None, None)
@@ -189,3 +217,100 @@ def test_planning_mode_no_longer_disables_editing_tools() -> None:
 
     assert "excluded_tools: []" in contents
     assert "read-only planning mode" in contents
+
+
+def test_apply_patch_add_update_move_and_delete(tmp_path: Path) -> None:
+    add_result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Add File: notes.txt
++hello
++world
+*** End Patch""",
+        dry_run=False,
+    )
+
+    assert add_result.success is True
+    assert (tmp_path / "notes.txt").read_text(encoding="utf-8") == "hello\nworld\n"
+    assert add_result.changes[0].operation == "add"
+
+    update_result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Update File: notes.txt
+*** Move to: docs/renamed.txt
+@@
+ hello
+-world
++serena
+*** End Patch""",
+        dry_run=False,
+    )
+
+    assert update_result.success is True
+    assert not (tmp_path / "notes.txt").exists()
+    assert (tmp_path / "docs" / "renamed.txt").read_text(encoding="utf-8") == "hello\nserena\n"
+    assert update_result.changes[0].move_path == "docs/renamed.txt"
+
+    delete_result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Delete File: docs/renamed.txt
+*** End Patch""",
+        dry_run=False,
+    )
+
+    assert delete_result.success is True
+    assert not (tmp_path / "docs" / "renamed.txt").exists()
+
+
+def test_apply_patch_dry_run_and_safety(tmp_path: Path) -> None:
+    dry_result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Add File: dry.txt
++not written
+*** End Patch""",
+        dry_run=True,
+    )
+
+    assert dry_result.success is True
+    assert not (tmp_path / "dry.txt").exists()
+
+    unsafe_result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Add File: ../outside.txt
++bad
+*** End Patch""",
+        dry_run=False,
+    )
+
+    assert unsafe_result.success is False
+    assert "escapes the active project" in unsafe_result.errors[0]
+
+
+def test_apply_patch_rejects_ambiguous_update_hunks(tmp_path: Path) -> None:
+    target = tmp_path / "dupes.txt"
+    target.write_text("same\nsame\n", encoding="utf-8")
+
+    result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Update File: dupes.txt
+@@
+-same
++changed
+*** End Patch""",
+        dry_run=False,
+    )
+
+    assert result.success is False
+    assert "matched multiple locations" in result.errors[0]
+    assert target.read_text(encoding="utf-8") == "same\nsame\n"
