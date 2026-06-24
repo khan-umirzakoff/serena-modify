@@ -3,14 +3,17 @@ from pathlib import Path
 from serena.tools.tools_base import ToolRegistry
 from serena.tools.workflow_tools import (
     MAX_GOAL_OBJECTIVE_CHARS,
+    _format_plan_markdown,
     _goal_public_state,
     _goal_response,
     _goal_state_path,
     _infer_validation_hints,
     _load_instruction_documents,
     _resolve_focus_dir,
+    _resolve_review_target,
     _save_goal_state,
     _validate_goal_objective,
+    _validate_plan,
 )
 
 
@@ -21,6 +24,9 @@ def test_coding_workflow_tools_are_registered() -> None:
     assert "get_coding_harness_instructions" in names
     assert "get_validation_commands" in names
     assert "finalize_coding_task" in names
+    assert "update_plan" in names
+    assert "prepare_review_task" in names
+    assert "finalize_review_task" in names
     assert "get_goal" in names
     assert "create_goal" in names
     assert "update_goal" in names
@@ -137,3 +143,49 @@ def test_goal_public_state_and_response_include_remaining_budget(tmp_path: Path)
     assert "<objective>\nfinish harness\n</objective>" in response["runtime_prompts"]["continuation"]
     assert "Tokens remaining: 75" in response["runtime_prompts"]["objective_updated"]
     assert "Time spent pursuing goal:" in response["runtime_prompts"]["budget_limit"]
+
+
+def test_update_plan_validation_matches_codex_shape() -> None:
+    plan = [
+        {"step": "Inspect Codex plan tool", "status": "completed"},
+        {"step": "Implement Serena plan tool", "status": "in_progress"},
+        {"step": "Run tests", "status": "pending"},
+    ]
+
+    _validate_plan(plan)
+
+    assert _format_plan_markdown(plan) == ("- [x] Inspect Codex plan tool\n- [~] Implement Serena plan tool\n- [ ] Run tests")
+
+    try:
+        _validate_plan(
+            [
+                {"step": "one", "status": "in_progress"},
+                {"step": "two", "status": "in_progress"},
+            ]
+        )
+    except ValueError as e:
+        assert "at most one" in str(e)
+    else:
+        raise AssertionError("Expected multiple in_progress plan items to be rejected")
+
+
+def test_resolve_review_target_uncommitted_and_commit(tmp_path: Path) -> None:
+    uncommitted = _resolve_review_target(tmp_path, "uncommitted", None, None, None)
+
+    assert uncommitted["target"] == "uncommitted_changes"
+    assert ["git", "diff", "--cached"] in uncommitted["diff_commands"]
+    assert "staged, unstaged, and untracked" in uncommitted["prompt"]
+
+    commit = _resolve_review_target(tmp_path, "commit", None, "abc1234", None)
+
+    assert commit["target"] == "commit"
+    assert commit["user_facing_hint"].startswith("commit abc1234")
+    assert commit["diff_commands"] == [["git", "show", "--format=medium", "--patch", "abc1234"]]
+
+
+def test_planning_mode_no_longer_disables_editing_tools() -> None:
+    planning_mode = Path(__file__).parents[2] / "src" / "serena" / "resources" / "config" / "modes" / "planning.yml"
+    contents = planning_mode.read_text(encoding="utf-8")
+
+    assert "excluded_tools: []" in contents
+    assert "read-only planning mode" in contents

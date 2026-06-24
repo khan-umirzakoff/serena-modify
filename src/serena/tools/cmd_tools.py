@@ -315,9 +315,14 @@ class TerminalProcessManager:
             self._sessions[session.session_id] = session
 
     def _cleanup_exited_locked(self) -> None:
-        for session_id, session in list(self._sessions.items()):
-            if session.process.poll() is not None:
-                del self._sessions[session_id]
+        exited = [session for session in self._sessions.values() if session.process.poll() is not None]
+        protected = {
+            session.session_id
+            for session in sorted(exited, key=lambda item: item.last_used, reverse=True)[:PROTECTED_RECENT_TERMINAL_SESSIONS]
+        }
+        for session in exited:
+            if session.session_id not in protected:
+                del self._sessions[session.session_id]
 
     def _prune_session_locked(self) -> TerminalSession | None:
         if not self._sessions:
@@ -345,7 +350,7 @@ class TerminalProcessManager:
         if session.process.poll() is None:
             return
         with self._lock:
-            self._sessions.pop(session.session_id, None)
+            self._cleanup_exited_locked()
 
     def exec_command(
         self,
@@ -585,7 +590,7 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
 
     def apply(
         self,
-        session_id: int,
+        terminal_session_id: int,
         chars: str = "",
         yield_time_ms: int | None = None,
         max_output_tokens: int | None = None,
@@ -593,14 +598,14 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
         """
         Write characters to an existing terminal session and return recent bounded output.
 
-        :param session_id: session identifier returned by `exec_command`
+        :param terminal_session_id: terminal session identifier returned as `session_id` by `exec_command`
         :param chars: bytes/characters to write to stdin. Empty string polls without writing.
         :param yield_time_ms: wait before yielding output. Non-empty writes default to 250 ms; empty polls default to 5000 ms.
         :param max_output_tokens: approximate output budget for this response. Defaults to 10000 tokens.
         :return: JSON terminal response with recent output, exit status, and continuing session ID if still running
         """
         response = TERMINAL_PROCESS_MANAGER.write_stdin(
-            session_id=session_id,
+            session_id=terminal_session_id,
             chars=chars,
             yield_time_ms=yield_time_ms,
             max_output_tokens=max_output_tokens,
@@ -627,12 +632,12 @@ class StopTerminalSessionTool(Tool, ToolMarkerCanEdit):
     Stops a running `exec_command` terminal session.
     """
 
-    def apply(self, session_id: int) -> str:
+    def apply(self, terminal_session_id: int) -> str:
         """
         Terminate a running terminal session and remove it from the session registry.
 
-        :param session_id: session identifier returned by `exec_command`
+        :param terminal_session_id: terminal session identifier returned as `session_id` by `exec_command`
         :return: JSON stop result
         """
-        stopped = TERMINAL_PROCESS_MANAGER.stop_session(session_id)
-        return json.dumps({"session_id": session_id, "stopped": stopped}, ensure_ascii=False, indent=2)
+        stopped = TERMINAL_PROCESS_MANAGER.stop_session(terminal_session_id)
+        return json.dumps({"session_id": terminal_session_id, "stopped": stopped}, ensure_ascii=False, indent=2)

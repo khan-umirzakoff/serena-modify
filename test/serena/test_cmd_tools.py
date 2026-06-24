@@ -115,17 +115,22 @@ def test_huge_output_is_bounded(tmp_path: Path) -> None:
     assert len(response.output) < 1500
 
 
-def test_session_is_removed_after_clean_exit(tmp_path: Path) -> None:
+def test_session_can_be_polled_after_clean_exit(tmp_path: Path) -> None:
     manager = TerminalProcessManager()
     command = _python_command("import time; time.sleep(0.5); print('done', flush=True)")
 
     first = manager.exec_command(command, cwd=tmp_path, yield_time_ms=250)
     session_id = first.session_id
     assert session_id is not None
-    manager.write_stdin(session_id, yield_time_ms=1000)
 
-    with pytest.raises(ValueError):
-        manager.write_stdin(session_id, yield_time_ms=250)
+    final = manager.write_stdin(session_id, yield_time_ms=1000)
+    assert final.running is False
+    assert final.session_id is None
+    assert "done" in final.output
+
+    repeated = manager.write_stdin(session_id, yield_time_ms=250)
+    assert repeated.running is False
+    assert repeated.session_id is None
 
 
 def test_list_and_stop_terminal_sessions(tmp_path: Path) -> None:

@@ -55,13 +55,21 @@ class CodingTaskSnapshot:
     instruction_documents: list[ProjectInstructionDocument]
     validation_hints: ValidationHints
     active_goal: dict[str, Any] | None
+    active_plan: dict[str, Any] | None
     git_status: CommandSnapshot
     git_diff_stat: CommandSnapshot
 
 
 GOAL_STATE_FILENAME = "goal_state.json"
+PLAN_STATE_FILENAME = "plan_state.json"
 MAX_GOAL_OBJECTIVE_CHARS = 4000
 MODEL_SETTABLE_GOAL_STATUSES = {"complete", "blocked"}
+PLAN_STATUSES = {"pending", "in_progress", "completed"}
+DEFAULT_REVIEW_DIFF_MAX_CHARS = 60_000
+
+
+def _serena_state_path(project_root: Path, filename: str) -> Path:
+    return project_root / ".serena" / filename
 
 
 def _utc_now() -> str:
@@ -76,7 +84,11 @@ def _parse_time(value: str) -> datetime | None:
 
 
 def _goal_state_path(project_root: Path) -> Path:
-    return project_root / ".serena" / GOAL_STATE_FILENAME
+    return _serena_state_path(project_root, GOAL_STATE_FILENAME)
+
+
+def _plan_state_path(project_root: Path) -> Path:
+    return _serena_state_path(project_root, PLAN_STATE_FILENAME)
 
 
 def _validate_goal_objective(objective: str) -> None:
@@ -248,6 +260,172 @@ def _append_goal_note(state: dict[str, Any], note: str) -> None:
         progress = []
         state["progress"] = progress
     progress.append({"at": _utc_now(), "note": note})
+
+
+def _truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    half = max_chars // 2
+    tail = max_chars - half
+    omitted = len(text) - max_chars
+    return text[:half] + f"\n...[omitted {omitted} chars from middle]...\n" + text[-tail:], True
+
+
+def _save_plan_state(project_root: Path, state: dict[str, Any]) -> None:
+    path = _plan_state_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _load_plan_state(project_root: Path) -> dict[str, Any] | None:
+    path = _plan_state_path(project_root)
+    if not path.is_file():
+        return None
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _plan_public_state(project_root: Path) -> dict[str, Any] | None:
+    state = _load_plan_state(project_root)
+    if state is None:
+        return None
+    state = dict(state)
+    state["state_path"] = str(_plan_state_path(project_root))
+    return state
+
+
+def _validate_plan(plan: list[dict[str, Any]]) -> None:
+    in_progress_count = 0
+    for index, item in enumerate(plan):
+        step = item.get("step")
+        status = item.get("status")
+        if not isinstance(step, str) or not step.strip():
+            raise ValueError(f"plan item {index} must include a non-empty step")
+        if status not in PLAN_STATUSES:
+            raise ValueError(f"plan item {index} status must be one of {sorted(PLAN_STATUSES)}")
+        if status == "in_progress":
+            in_progress_count += 1
+    if in_progress_count > 1:
+        raise ValueError("at most one plan item can be in_progress")
+
+
+def _format_plan_markdown(plan: list[dict[str, Any]]) -> str:
+    markers = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+    return "\n".join(f"- {markers.get(item['status'], '[ ]')} {item['step']}" for item in plan)
+
+
+def _run_git_text(project_root: Path, command: list[str], max_chars: int = 12000) -> dict[str, Any]:
+    snapshot = _run_git_snapshot(project_root, command)
+    output, truncated = _truncate_text(snapshot.output, max_chars)
+    return {
+        "command": snapshot.command,
+        "exit_code": snapshot.exit_code,
+        "output": output,
+        "truncated": truncated,
+    }
+
+
+def _review_findings_schema() -> dict[str, Any]:
+    return {
+        "findings": [
+            {
+                "title": "[P1] Short actionable issue title",
+                "body": "One concise paragraph explaining why this is a bug and when it matters.",
+                "confidence_score": 0.0,
+                "priority": 1,
+                "code_location": {
+                    "absolute_file_path": "/absolute/path/to/file",
+                    "line_range": {"start": 1, "end": 1},
+                },
+            }
+        ],
+        "overall_correctness": "patch is correct | patch is incorrect",
+        "overall_explanation": "1-3 sentence explanation.",
+        "overall_confidence_score": 0.0,
+    }
+
+
+def _review_rubric() -> str:
+    return """Review stance: prioritize discrete, actionable bugs introduced by the change.
+Flag issues that affect correctness, security, performance, reliability, or meaningful maintainability.
+Do not flag trivial style, speculative risks, pre-existing issues, or intentional behavior changes unless evidence shows a bug.
+Every finding must cite the smallest useful changed line range, preferably no more than 5-10 lines.
+Use priorities P0-P3. Prefer no findings when there is no issue the author would clearly fix.
+Return the exact JSON review schema; do not include markdown fences or extra prose."""
+
+
+def _resolve_review_target(
+    project_root: Path, target: str, base_branch: str | None, commit_sha: str | None, instructions: str | None
+) -> dict[str, Any]:
+    normalized = target.strip().lower().replace("-", "_")
+    if normalized in {"uncommitted", "uncommitted_changes", ""}:
+        return {
+            "target": "uncommitted_changes",
+            "user_facing_hint": "current changes",
+            "prompt": "Review the current code changes, including staged, unstaged, and untracked files. Provide prioritized, actionable findings.",
+            "diff_commands": [
+                ["git", "diff", "--cached"],
+                ["git", "diff"],
+            ],
+            "extra_commands": [
+                ["git", "status", "--short"],
+                ["git", "ls-files", "--others", "--exclude-standard"],
+            ],
+        }
+    if normalized == "base_branch":
+        if not base_branch or not base_branch.strip():
+            raise ValueError("base_branch is required when target='base_branch'")
+        branch = base_branch.strip()
+        merge_base = _run_git_snapshot(project_root, ["merge-base", "HEAD", branch]).output.strip()
+        if merge_base:
+            prompt = (
+                f"Review the code changes against base branch '{branch}'. The merge base is {merge_base}. "
+                "Provide prioritized, actionable findings."
+            )
+            diff_commands = [["git", "diff", merge_base]]
+        else:
+            prompt = (
+                f"Review the code changes against base branch '{branch}'. Determine the merge base if needed, "
+                "inspect the merge diff, and provide prioritized, actionable findings."
+            )
+            diff_commands = [["git", "diff", branch]]
+        return {
+            "target": "base_branch",
+            "user_facing_hint": f"changes against '{branch}'",
+            "prompt": prompt,
+            "diff_commands": diff_commands,
+            "extra_commands": [["git", "status", "--short"]],
+        }
+    if normalized == "commit":
+        if not commit_sha or not commit_sha.strip():
+            raise ValueError("commit_sha is required when target='commit'")
+        sha = commit_sha.strip()
+        title = _run_git_snapshot(project_root, ["show", "-s", "--format=%s", sha]).output.strip()
+        prompt = f"Review the code changes introduced by commit {sha}"
+        if title:
+            prompt += f' ("{title}")'
+        prompt += ". Provide prioritized, actionable findings."
+        return {
+            "target": "commit",
+            "user_facing_hint": f"commit {sha[:7]}" + (f": {title}" if title else ""),
+            "prompt": prompt,
+            "diff_commands": [["git", "show", "--format=medium", "--patch", sha]],
+            "extra_commands": [["git", "status", "--short"]],
+        }
+    if normalized == "custom":
+        if not instructions or not instructions.strip():
+            raise ValueError("instructions is required when target='custom'")
+        return {
+            "target": "custom",
+            "user_facing_hint": instructions.strip(),
+            "prompt": instructions.strip(),
+            "diff_commands": [["git", "diff", "--cached"], ["git", "diff"]],
+            "extra_commands": [["git", "status", "--short"]],
+        }
+    raise ValueError("target must be one of: uncommitted, base_branch, commit, custom")
 
 
 def _relative_path(path: Path, root: Path) -> str:
@@ -521,6 +699,7 @@ class PrepareCodingTaskTool(Tool):
             instruction_documents=instruction_documents,
             validation_hints=_infer_validation_hints(project_root),
             active_goal=_goal_public_state(project_root),
+            active_plan=_plan_public_state(project_root),
             git_status=_run_git_snapshot(project_root, ["status", "--short"]),
             git_diff_stat=_run_git_snapshot(project_root, ["diff", "--stat"]),
         )
@@ -548,6 +727,10 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "dirty_tree": "Preserve existing user changes and inspect git status/diff before editing touched areas.",
             },
             "tool_use": {
+                "plan": (
+                    "Use update_plan as a lightweight checklist for meaningful multi-step work. "
+                    "It must not switch Serena modes or disable tools; after calling it, briefly reflect the current plan in chat."
+                ),
                 "code_understanding": "Prefer Serena search and symbol tools before editing unfamiliar code.",
                 "edits": "Keep changes scoped. Avoid unrelated rewrites and do not overwrite unknown user edits.",
                 "terminal": (
@@ -561,6 +744,10 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "source": "Use get_validation_commands and project scripts to choose focused checks.",
                 "behavior": "Run validation when practical. If blocked by missing tools or environment setup, report the blocker precisely.",
             },
+            "review": {
+                "start": "Use prepare_review_task for review requests, then inspect the returned diff/context and produce prioritized findings.",
+                "finish": "Use finalize_review_task to wrap review output when the user initiated a review workflow.",
+            },
             "finalization": {
                 "goal_status": "Use update_goal only to mark an existing goal complete or genuinely blocked.",
                 "completion_audit": "Mark complete only when current evidence proves the full objective is achieved.",
@@ -570,12 +757,15 @@ class GetCodingHarnessInstructionsTool(Tool):
             },
             "terminal_tools": ["exec_command", "write_stdin", "list_terminal_sessions", "stop_terminal_session", "execute_shell_command"],
             "workflow_tools": [
+                "update_plan",
                 "get_goal",
                 "create_goal",
                 "update_goal",
                 "record_goal_progress",
                 "summarize_goal_for_new_chat",
                 "prepare_coding_task",
+                "prepare_review_task",
+                "finalize_review_task",
                 "get_validation_commands",
                 "finalize_coding_task",
             ],
@@ -603,6 +793,7 @@ class FinalizeCodingTaskTool(Tool):
             "project_name": active_project.project_name,
             "project_root": str(project_root),
             "active_goal": _goal_public_state(project_root),
+            "active_plan": _plan_public_state(project_root),
             "git_status": asdict(_run_git_snapshot(project_root, ["status", "--short"])),
             "git_diff_stat": asdict(_run_git_snapshot(project_root, ["diff", "--stat"])),
             "git_diff_names": asdict(_run_git_snapshot(project_root, ["diff", "--name-only"])),
@@ -628,6 +819,128 @@ class GetValidationCommandsTool(Tool):
         project_root = Path(active_project.project_root).resolve()
         hints = _infer_validation_hints(project_root)
         return json.dumps(asdict(hints), ensure_ascii=False, indent=2)
+
+
+class UpdatePlanTool(Tool):
+    """
+    Codex-style lightweight checklist tool for ongoing coding work.
+    """
+
+    def apply(self, plan: list[dict[str, str]], explanation: str | None = None) -> str:
+        """
+        Update the current task plan without switching Serena modes or disabling tools.
+
+        :param plan: list of plan items, each with `step` and status `pending`, `in_progress`, or `completed`
+        :param explanation: optional concise reason for this plan update
+        :return: JSON plan state plus markdown that should be reflected to the user in chat
+        """
+        normalized_plan = [{"step": item.get("step", "").strip(), "status": item.get("status", "")} for item in plan]
+        _validate_plan(normalized_plan)
+
+        active_project = self.agent.get_active_project_or_raise()
+        project_root = Path(active_project.project_root).resolve()
+        state = {
+            "updated_at": _utc_now(),
+            "explanation": explanation.strip() if isinstance(explanation, str) and explanation.strip() else None,
+            "plan": normalized_plan,
+            "state_path": str(_plan_state_path(project_root)),
+        }
+        _save_plan_state(project_root, state)
+        markdown = _format_plan_markdown(normalized_plan)
+        return json.dumps(
+            {
+                "message": "Plan updated",
+                "plan": normalized_plan,
+                "explanation": state["explanation"],
+                "markdown": markdown,
+                "user_visible_instruction": "Briefly reflect this plan/status in chat, then continue the work.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+class PrepareReviewTaskTool(Tool):
+    """
+    Prepares a Codex-style review task context for the main ChatGPT/Serena agent.
+    """
+
+    def apply(
+        self,
+        target: str = "uncommitted",
+        base_branch: str | None = None,
+        commit_sha: str | None = None,
+        instructions: str | None = None,
+        max_diff_chars: int = DEFAULT_REVIEW_DIFF_MAX_CHARS,
+    ) -> str:
+        """
+        Prepare review prompt, git context, and bounded diff for a review task.
+
+        :param target: one of `uncommitted`, `base_branch`, `commit`, or `custom`
+        :param base_branch: base branch for target `base_branch`
+        :param commit_sha: commit SHA for target `commit`
+        :param instructions: custom review instructions for target `custom`
+        :param max_diff_chars: maximum characters to include across diff outputs
+        :return: JSON review task context
+        """
+        active_project = self.agent.get_active_project_or_raise()
+        project_root = Path(active_project.project_root).resolve()
+        resolved = _resolve_review_target(project_root, target, base_branch, commit_sha, instructions)
+        per_diff_budget = max(1000, max_diff_chars // max(1, len(resolved["diff_commands"])))
+        diffs = [_run_git_text(project_root, command, per_diff_budget) for command in resolved["diff_commands"]]
+        extra_context = [_run_git_text(project_root, command, 12000) for command in resolved["extra_commands"]]
+        payload = {
+            "target": resolved["target"],
+            "user_facing_hint": resolved["user_facing_hint"],
+            "review_prompt": resolved["prompt"],
+            "review_rubric": _review_rubric(),
+            "findings_schema": _review_findings_schema(),
+            "project_root": str(project_root),
+            "git_context": extra_context,
+            "diffs": diffs,
+            "output_contract": (
+                "Findings first, ordered by severity. If no actionable issues are found, say so clearly. "
+                "Use finalize_review_task when wrapping a user-initiated review result."
+            ),
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+class FinalizeReviewTaskTool(Tool):
+    """
+    Wraps review output using Codex-style review completion context.
+    """
+
+    def apply(self, review_results: str | None = None, interrupted: bool = False) -> str:
+        """
+        Finalize a review task.
+
+        :param review_results: JSON or text review output
+        :param interrupted: true if the review was interrupted
+        :return: JSON containing Codex-style review wrapper text
+        """
+        if interrupted:
+            wrapper = (
+                "<user_action>\n"
+                "  <context>User initiated a review task, but it was interrupted. If asked, tell them to re-initiate the review and wait for it to complete.</context>\n"
+                "  <action>review</action>\n"
+                "  <results>\n"
+                "  None.\n"
+                "  </results>\n"
+                "</user_action>\n"
+            )
+        else:
+            results = (review_results or "").strip() or "No review output was provided."
+            wrapper = (
+                "<user_action>\n"
+                "  <context>User initiated a review task. Here's the full review output. User may select one or more comments to resolve.</context>\n"
+                "  <action>review</action>\n"
+                "  <results>\n"
+                f"  {results}\n"
+                "  </results>\n"
+                "</user_action>\n"
+            )
+        return json.dumps({"review_wrapper": wrapper}, ensure_ascii=False, indent=2)
 
 
 class GetGoalTool(Tool):

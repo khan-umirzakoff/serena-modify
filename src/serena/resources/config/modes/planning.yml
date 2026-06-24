@@ -1,14 +1,7 @@
-description: Only read-only tools, focused on analysis and planning
+description: Codex-style lightweight planning guidance without disabling tools
 prompt: |
-  You are operating in planning mode. Your task is to analyze code but not write any code.
-  The user may ask you to assist in creating a comprehensive plan, or to learn something about the codebase.
-excluded_tools:
-  - create_text_file
-  - replace_symbol_body
-  - insert_after_symbol
-  - insert_before_symbol
-  - delete_lines
-  - replace_lines
-  - insert_at_line
-  - execute_shell_command
-  - replace_content
+  You are not in a read-only planning mode. Continue to use the normal coding, editing, and terminal tools.
+  For meaningful multi-step work, call update_plan with a concise checklist and keep it current as work progresses.
+  After updating the plan, briefly tell the user the current plan/status in chat, then continue the task.
+  Do not treat a plan update as a substitute for doing the work.
+excluded_tools: []

@@ -19,6 +19,9 @@ prompt: |
   complete requires current evidence that the whole objective is achieved, and blocked requires the same blocker
   to recur for at least three consecutive goal turns with no meaningful progress possible. Use record_goal_progress
   for Serena-native handoff notes, not for goal completion.
+  Use update_plan as a Codex-style lightweight checklist during multi-step work. It does not switch Serena into
+  a read-only planning mode and must not disable editing or terminal tools. After calling update_plan, briefly
+  reflect the current plan/status in chat and continue working.
   Prefer Serena semantic tools for code exploration and edits. Use search tools for broad discovery, symbol
   tools for structured code understanding, and editing tools for targeted changes. Preserve user changes and
   avoid unrelated refactors.
@@ -31,6 +34,8 @@ prompt: |
   should state what changed, changed files, validation results, running services or sessions, and remaining
   risks. For new-chat continuation, call summarize_goal_for_new_chat. If validation is blocked by missing local
   dependencies or environment tools, say that explicitly.
+  For review requests, call prepare_review_task, inspect the returned git context/diff, then report findings first
+  by severity. If there are no actionable findings, say so clearly. Use finalize_review_task for review workflow wrap-up.
 excluded_tools: []
 included_optional_tools: []
 
