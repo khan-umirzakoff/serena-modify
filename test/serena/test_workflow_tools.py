@@ -141,7 +141,12 @@ def test_goal_public_state_and_response_include_remaining_budget(tmp_path: Path)
     assert response["remaining_tokens"] == 75
     assert "tokens_used=25" in response["completion_budget_report"]
     assert response["runtime_prompts"]["continuation"].startswith('<codex_internal_context source="serena_goal_continuation">')
-    assert "<objective>\nfinish harness\n</objective>" in response["runtime_prompts"]["continuation"]
+    continuation = response["runtime_prompts"]["continuation"]
+    assert "<objective>\nfinish harness\n</objective>" in continuation
+    assert "Continuation behavior:" in continuation
+    assert "Completion audit:" in continuation
+    assert "Blocked audit:" in continuation
+    assert "Do not call update_goal unless the goal is complete" in continuation
     assert "Tokens remaining: 75" in response["runtime_prompts"]["objective_updated"]
     assert "Time spent pursuing goal:" in response["runtime_prompts"]["budget_limit"]
 
