@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from serena.tools.task_catalog import discover_task_catalog
 from serena.tools.tools_base import ToolRegistry
 from serena.tools.workflow_tools import (
     MAX_GOAL_OBJECTIVE_CHARS,
@@ -25,6 +26,8 @@ def test_coding_workflow_tools_are_registered() -> None:
     assert "prepare_coding_task" in names
     assert "get_coding_harness_instructions" in names
     assert "get_validation_commands" in names
+    assert "discover_project_tasks" in names
+    assert "run_task" in names
     assert "finalize_coding_task" in names
     assert "update_plan" in names
     assert "prepare_review_task" in names
@@ -94,9 +97,52 @@ test = "pytest test"
 
     hints = _infer_validation_hints(tmp_path)
 
-    assert hints.package_files == ["pyproject.toml", "uv.lock", "package.json", "pnpm-lock.yaml"]
-    assert hints.detected_package_managers == ["uv", "pnpm"]
-    assert hints.likely_commands == ["uv run poe lint", "uv run poe test", "pnpm lint", "pnpm test", "pnpm build"]
+    assert hints.package_files == ["package.json", "pyproject.toml"]
+    assert hints.detected_package_managers == ["pnpm", "uv", "poe"]
+    assert hints.likely_commands == ["pnpm lint", "uv run poe lint", "pnpm test", "uv run poe test", "pnpm build"]
+
+
+def test_discover_task_catalog_supports_broad_manifests(tmp_path: Path) -> None:
+    (tmp_path / "Cargo.toml").write_text("[package]\nname = 'demo'\nversion = '0.1.0'\n", encoding="utf-8")
+    (tmp_path / "go.mod").write_text("module example.com/demo\n", encoding="utf-8")
+    (tmp_path / "Makefile").write_text("test:\n\ttrue\nbuild:\n\ttrue\n", encoding="utf-8")
+    (tmp_path / "justfile").write_text("lint:\n    true\n", encoding="utf-8")
+    (tmp_path / "Taskfile.yml").write_text("tasks:\n  verify:\n    cmds:\n      - true\n", encoding="utf-8")
+    (tmp_path / ".serena").mkdir()
+    (tmp_path / ".serena" / "tasks.json").write_text(
+        '{"tasks": [{"task_id": "custom:verify", "kind": "verify", "command": "echo ok"}]}',
+        encoding="utf-8",
+    )
+
+    catalog = discover_task_catalog(tmp_path)
+    task_ids = {task.task_id for task in catalog.tasks}
+
+    assert "custom:verify" in task_ids
+    assert "root:cargo:check:check" in task_ids
+    assert "root:go:test:test" in task_ids
+    assert "root:just:lint:lint" in task_ids
+    assert "root:task:verify:verify" in task_ids
+    assert "cargo" in catalog.detected_package_managers
+    assert "go" in catalog.detected_package_managers
+    assert "make" in catalog.detected_package_managers
+
+
+def test_task_catalog_filtered_view_hides_internal_tasks_and_prefers_root_tasks(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.poe.tasks]\n_hidden = 'echo hidden'\nlint = 'echo lint'\n", encoding="utf-8")
+    nested = tmp_path / "test" / "resources" / "repos" / "rust"
+    nested.mkdir(parents=True)
+    (nested / "Cargo.toml").write_text("[package]\nname = 'fixture'\nversion = '0.1.0'\n", encoding="utf-8")
+
+    catalog = discover_task_catalog(tmp_path)
+    filtered = catalog.filtered(include_internal=False, max_tasks=2)
+
+    assert all(task.visibility == "public" for task in filtered.tasks)
+    assert [task.workdir for task in filtered.tasks] == [".", "."]
+    assert all("test/resources" not in package_file for package_file in catalog.package_files)
+    assert "echo hidden" not in filtered.validation_hints.likely_commands
+
+    catalog_with_fixtures = discover_task_catalog(tmp_path, include_fixtures=True)
+    assert any("test/resources" in package_file for package_file in catalog_with_fixtures.package_files)
 
 
 def test_goal_objective_validation_matches_codex_limits() -> None:

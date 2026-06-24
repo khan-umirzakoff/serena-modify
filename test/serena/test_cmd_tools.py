@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from serena.tools.cmd_tools import TerminalProcessManager
+from serena.tools.cmd_tools import TerminalProcessManager, _terminal_context_warnings
 from serena.tools.tools_base import ToolRegistry
 
 
@@ -19,6 +19,18 @@ def test_exec_command_tool_and_write_stdin_tool_are_registered() -> None:
     assert "write_stdin" in names
     assert "list_terminal_sessions" in names
     assert "stop_terminal_session" in names
+
+
+def test_terminal_context_warns_for_nested_repo(tmp_path: Path) -> None:
+    project_root = tmp_path / "workspace"
+    nested_repo = project_root / "app"
+    nested_repo.mkdir(parents=True)
+    (nested_repo / ("." + "git")).mkdir()
+
+    warnings = _terminal_context_warnings(project_root, nested_repo)
+
+    assert warnings
+    assert "nested Git repository" in warnings[0]
 
 
 def test_short_command_exits_and_returns_output(tmp_path: Path) -> None:

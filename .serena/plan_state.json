@@ -1,17 +1,21 @@
 {
-  "updated_at": "2026-06-24T03:43:09.519278Z",
-  "explanation": "Goal continuation prompt va prepare snapshot Codex goal behavioriga yaqinlashtirildi.",
+  "updated_at": "2026-06-24T17:26:52.462537Z",
+  "explanation": "Terminal context guard, Task Catalog include params, docs/memory, and focused validation are complete.",
   "plan": [
     {
-      "step": "Inspect Codex real goal prompt/templates",
+      "step": "Verify Task Catalog schema state",
       "status": "completed"
     },
     {
-      "step": "Patch Serena goal continuation to Codex-strength behavior",
+      "step": "Add active-project/workdir mismatch guard",
       "status": "completed"
     },
     {
-      "step": "Validate focused tests and lint",
+      "step": "Expose include_* params cleanly if needed",
+      "status": "completed"
+    },
+    {
+      "step": "Run focused validation",
       "status": "completed"
     }
   ],

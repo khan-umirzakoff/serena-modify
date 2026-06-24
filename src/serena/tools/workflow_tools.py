@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from serena.tools import Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
+from serena.tools.task_catalog import TaskCatalog, ValidationHints, discover_task_catalog, infer_validation_hints
 
 
 @dataclass(frozen=True)
@@ -34,15 +35,6 @@ class CommandSnapshot:
 
 
 @dataclass(frozen=True)
-class ValidationHints:
-    """Likely validation commands inferred from project files."""
-
-    package_files: list[str]
-    detected_package_managers: list[str]
-    likely_commands: list[str]
-
-
-@dataclass(frozen=True)
 class CodingTaskSnapshot:
     """Codex-style project snapshot prepared before code editing."""
 
@@ -54,6 +46,8 @@ class CodingTaskSnapshot:
     active_tools: list[str]
     instruction_documents: list[ProjectInstructionDocument]
     validation_hints: ValidationHints
+    task_catalog_summary: dict[str, Any]
+    task_catalog: TaskCatalog
     active_goal: dict[str, Any] | None
     active_goal_runtime_prompts: dict[str, str] | None
     active_plan: dict[str, Any] | None
@@ -651,61 +645,12 @@ def _node_run_command(package_manager: str, script: str) -> str:
 
 def _infer_validation_hints(project_root: Path) -> ValidationHints:
     """
-    Infer likely validation commands from common project files.
+    Infer likely validation commands from the universal task catalog.
 
     :param project_root: active Serena project root
     :return: likely validation commands and source files
     """
-    package_files: list[str] = []
-    managers: list[str] = []
-    likely_commands: list[str] = []
-
-    pyproject = project_root / "pyproject.toml"
-    if pyproject.is_file():
-        _append_unique(package_files, "pyproject.toml")
-        pyproject_data = _read_toml_file(pyproject)
-        if (project_root / "uv.lock").is_file():
-            _append_unique(package_files, "uv.lock")
-            _append_unique(managers, "uv")
-            python_prefix = "uv run "
-        else:
-            _append_unique(managers, "python")
-            python_prefix = ""
-
-        poe_tasks = pyproject_data.get("tool", {}).get("poe", {}).get("tasks", {})
-        if isinstance(poe_tasks, dict):
-            if "lint" in poe_tasks:
-                likely_commands.append(f"{python_prefix}poe lint")
-            if "test" in poe_tasks:
-                likely_commands.append(f"{python_prefix}poe test")
-        if not any(command.endswith("pytest") or "poe test" in command for command in likely_commands):
-            likely_commands.append(f"{python_prefix}pytest")
-
-    package_json = project_root / "package.json"
-    if package_json.is_file():
-        _append_unique(package_files, "package.json")
-        package_manager = _detect_node_package_manager(project_root, package_files, managers)
-        scripts = _read_json_file(package_json).get("scripts", {})
-        if isinstance(scripts, dict):
-            for script in ("lint", "typecheck", "type-check", "test", "test:unit", "build"):
-                if script in scripts:
-                    likely_commands.append(_node_run_command(package_manager, script))
-
-    if (project_root / "Cargo.toml").is_file():
-        _append_unique(package_files, "Cargo.toml")
-        _append_unique(managers, "cargo")
-        likely_commands.extend(["cargo fmt --check", "cargo test"])
-
-    if (project_root / "go.mod").is_file():
-        _append_unique(package_files, "go.mod")
-        _append_unique(managers, "go")
-        likely_commands.extend(["go test ./...", "go vet ./..."])
-
-    return ValidationHints(
-        package_files=package_files,
-        detected_package_managers=managers,
-        likely_commands=list(dict.fromkeys(likely_commands)),
-    )
+    return infer_validation_hints(project_root)
 
 
 def _active_serena_state(agent: Any) -> tuple[str, list[str], list[str]]:
@@ -1041,6 +986,8 @@ class PrepareCodingTaskTool(Tool):
         )
 
         context, modes, active_tools = _active_serena_state(self.agent)
+        full_task_catalog = discover_task_catalog(project_root)
+        task_catalog = full_task_catalog.filtered(include_internal=False, max_tasks=15)
 
         snapshot = CodingTaskSnapshot(
             project_name=active_project.project_name,
@@ -1050,7 +997,9 @@ class PrepareCodingTaskTool(Tool):
             modes=modes,
             active_tools=active_tools,
             instruction_documents=instruction_documents,
-            validation_hints=_infer_validation_hints(project_root),
+            validation_hints=task_catalog.validation_hints,
+            task_catalog_summary=full_task_catalog.summary(),
+            task_catalog=task_catalog,
             active_goal=_goal_public_state(project_root),
             active_goal_runtime_prompts=_goal_runtime_prompts(_goal_public_state(project_root)),
             active_plan=_plan_public_state(project_root),
@@ -1168,16 +1117,124 @@ class GetValidationCommandsTool(Tool):
     Returns inferred project validation commands.
     """
 
-    def apply(self) -> str:
+    def apply(self, include_internal: bool = False, max_tasks: int = 30) -> str:
         """
         Return likely validation commands for the active project.
 
+        :param include_internal: whether internal helper tasks should be included
+        :param max_tasks: maximum number of validation tasks to consider
         :return: JSON validation command hints
         """
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
-        hints = _infer_validation_hints(project_root)
-        return json.dumps(asdict(hints), ensure_ascii=False, indent=2)
+        catalog = discover_task_catalog(project_root).filtered(include_internal=include_internal, max_tasks=max_tasks)
+        return json.dumps(asdict(catalog.validation_hints), ensure_ascii=False, indent=2)
+
+
+class DiscoverProjectTasksTool(Tool):
+    """
+    Discovers runnable project tasks without requiring semantic indexing.
+    """
+
+    def apply(
+        self,
+        max_depth: int = 5,
+        include_internal: bool = False,
+        include_fixtures: bool = False,
+        include_examples: bool = False,
+        include_ignored: bool = False,
+        max_tasks: int = 30,
+    ) -> str:
+        """
+        Return the universal project task catalog.
+
+        :param max_depth: maximum directory depth for manifest discovery
+        :param include_internal: whether internal helper tasks should be included
+        :param include_fixtures: whether fixture and test-resource manifests should be included
+        :param include_examples: whether example, sample, and demo manifests should be included
+        :param include_ignored: whether generated/dependency/cache directories should be scanned
+        :param max_tasks: maximum number of tasks to include in the task list; set to 0 for none
+        :return: JSON project task catalog
+        """
+        active_project = self.agent.get_active_project_or_raise()
+        project_root = Path(active_project.project_root).resolve()
+        catalog = discover_task_catalog(
+            project_root,
+            max_depth=max_depth,
+            include_fixtures=include_fixtures,
+            include_examples=include_examples,
+            include_ignored=include_ignored,
+        )
+        visible_catalog = catalog.filtered(include_internal=include_internal, max_tasks=max_tasks)
+        response = {
+            "summary": catalog.summary(),
+            "filtered": {
+                "include_internal": include_internal,
+                "include_fixtures": include_fixtures,
+                "include_examples": include_examples,
+                "include_ignored": include_ignored,
+                "max_tasks": max_tasks,
+                "returned_task_count": len(visible_catalog.tasks),
+            },
+            "catalog": asdict(visible_catalog),
+        }
+        return json.dumps(response, ensure_ascii=False, indent=2)
+
+
+class RunTaskTool(Tool, ToolMarkerCanEdit):
+    """
+    Runs a discovered project task by task_id instead of raw shell text.
+    """
+
+    def apply(
+        self,
+        task_id: str,
+        yield_time_ms: int = 10000,
+        max_output_tokens: int | None = None,
+        tty: bool | None = None,
+    ) -> str:
+        """
+        Run a task from the discovered task catalog.
+
+        :param task_id: task identifier returned by discover_project_tasks
+        :param yield_time_ms: wait before yielding output
+        :param max_output_tokens: approximate output budget
+        :param tty: override whether to run through PTY; defaults to task metadata
+        :return: JSON terminal response
+        """
+        from serena.tools.cmd_tools import TERMINAL_PROCESS_MANAGER, _json_response
+
+        active_project = self.agent.get_active_project_or_raise()
+        project_root = Path(active_project.project_root).resolve()
+        catalog = discover_task_catalog(project_root)
+        task = next((candidate for candidate in catalog.tasks if candidate.task_id == task_id), None)
+        if task is None:
+            catalog = discover_task_catalog(project_root, include_fixtures=True, include_examples=True)
+            task = next((candidate for candidate in catalog.tasks if candidate.task_id == task_id), None)
+        if task is None:
+            visible_catalog = catalog.filtered(include_internal=False, max_tasks=30)
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": f"Unknown task_id: {task_id}",
+                    "available_task_ids": [candidate.task_id for candidate in visible_catalog.tasks],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        workdir = (project_root / task.workdir).resolve()
+        if project_root not in [workdir, *workdir.parents]:
+            return json.dumps({"ok": False, "error": f"Task workdir escapes project root: {task.workdir}"}, ensure_ascii=False, indent=2)
+
+        response = TERMINAL_PROCESS_MANAGER.exec_command(
+            command=task.command,
+            cwd=workdir,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+            tty=task.interactive if tty is None else tty,
+        )
+        return _json_response(response)
 
 
 class UpdatePlanTool(Tool):

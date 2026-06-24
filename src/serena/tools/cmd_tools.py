@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from serena.tools import Tool, ToolMarkerCanEdit
@@ -135,6 +135,7 @@ class TerminalResponse:
     transport: str
     timed_out: bool = False
     pty_requested_but_pipe_used: bool = False
+    warnings: list[str] = field(default_factory=list)
 
 
 class TerminalSession:
@@ -484,6 +485,7 @@ def _json_response(response: TerminalResponse) -> str:
         "session_id": payload["session_id"],
         "original_token_count": payload["original_token_count"],
         "output": payload["output"],
+        "warnings": payload["warnings"],
         "command": payload["command"],
         "cwd": payload["cwd"],
         "pid": payload["pid"],
@@ -508,6 +510,56 @@ def _resolve_workdir(project_root: str, workdir: str | None) -> Path:
     if not resolved.is_dir():
         raise FileNotFoundError(f"Working directory does not exist: {resolved}")
     return resolved
+
+
+def _find_enclosing_git_root(path: Path) -> Path | None:
+    """
+    Return the nearest enclosing Git repository root.
+    """
+    for current in [path, *path.parents]:
+        if (current / ".git").exists():
+            return current
+    return None
+
+
+def _terminal_context_warnings(project_root: Path, workdir: Path) -> list[str]:
+    """
+    Return warnings for terminal context that differs from Serena's active project.
+    """
+    warnings: list[str] = []
+    project_root = project_root.resolve()
+    workdir = workdir.resolve()
+
+    try:
+        workdir.relative_to(project_root)
+    except ValueError:
+        warnings.append(
+            "Terminal workdir is outside the active Serena project root. "
+            f"Terminal cwd: {workdir}. Active project root: {project_root}. "
+            "Semantic tools and task discovery still use the active project; call activate_project(...) if this is the intended project."
+        )
+        return warnings
+
+    workdir_git_root = _find_enclosing_git_root(workdir)
+    if workdir_git_root is not None and workdir_git_root.resolve() != project_root:
+        warnings.append(
+            "Terminal workdir is inside a nested Git repository while the active Serena project is different. "
+            f"Nested Git root: {workdir_git_root.resolve()}. Active project root: {project_root}. "
+            "Terminal commands will run in the nested repo, but semantic tools and task discovery still use the active project; "
+            "call activate_project(...) for that repo if intended."
+        )
+
+    return warnings
+
+
+def _with_context_warnings(response: TerminalResponse, project_root: Path, workdir: Path) -> TerminalResponse:
+    """
+    Return a terminal response annotated with project/workdir context warnings.
+    """
+    warnings = [*response.warnings, *_terminal_context_warnings(project_root, workdir)]
+    if not warnings:
+        return response
+    return TerminalResponse(**{**asdict(response), "warnings": warnings})
 
 
 class ExecuteShellCommandTool(Tool, ToolMarkerCanEdit):
@@ -537,9 +589,11 @@ class ExecuteShellCommandTool(Tool, ToolMarkerCanEdit):
         :return: a JSON object containing command metadata, bounded output, exit code, and session/log information
         """
         del capture_stderr
-        workdir = _resolve_workdir(self.get_project_root(), cwd)
+        project_root = Path(self.get_project_root()).resolve()
+        workdir = _resolve_workdir(str(project_root), cwd)
         yield_time_ms = MIN_YIELD_TIME_MS if background else _bounded(timeout_seconds * 1000, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
         response = TERMINAL_PROCESS_MANAGER.exec_command(command=command, cwd=workdir, yield_time_ms=yield_time_ms)
+        response = _with_context_warnings(response, project_root, workdir)
         return self._limit_length(_json_response(response), max_answer_chars)
 
 
@@ -570,7 +624,8 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
         :param tty: request a PTY for interactive commands that need stdin, prompts, REPLs, or console behavior.
         :return: JSON terminal response with output, exit code or session ID, and temp log path
         """
-        workdir_path = _resolve_workdir(self.get_project_root(), workdir)
+        project_root = Path(self.get_project_root()).resolve()
+        workdir_path = _resolve_workdir(str(project_root), workdir)
         response = TERMINAL_PROCESS_MANAGER.exec_command(
             command=cmd,
             cwd=workdir_path,
@@ -580,6 +635,7 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
             login=login,
             tty=tty,
         )
+        response = _with_context_warnings(response, project_root, workdir_path)
         return _json_response(response)
 
 
