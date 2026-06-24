@@ -2,15 +2,512 @@
 Tools supporting the execution of (external) commands
 """
 
-import os.path
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from serena.tools import Tool, ToolMarkerCanEdit
-from serena.util.shell import execute_shell_command
+from solidlsp.util.subprocess_util import subprocess_kwargs, terminate_process_tree_with_kill_fallback
+
+DEFAULT_YIELD_TIME_MS = 10_000
+DEFAULT_STDIN_YIELD_TIME_MS = 250
+DEFAULT_EMPTY_POLL_YIELD_TIME_MS = 5_000
+MIN_YIELD_TIME_MS = 250
+MAX_YIELD_TIME_MS = 30_000
+MAX_EMPTY_POLL_YIELD_TIME_MS = 300_000
+DEFAULT_MAX_OUTPUT_TOKENS = 10_000
+MAX_LIVE_TERMINAL_SESSIONS = 64
+PROTECTED_RECENT_TERMINAL_SESSIONS = 8
+INTERRUPT = "\u0003"
+UNIFIED_EXEC_ENV = {
+    "NO_COLOR": "1",
+    "TERM": "dumb",
+    "LANG": "C.UTF-8",
+    "LC_CTYPE": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "COLORTERM": "",
+    "PAGER": "cat",
+    "GIT_PAGER": "cat",
+    "GH_PAGER": "cat",
+    "SERENA_CI": "1",
+}
+
+
+def _bounded(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def _max_output_bytes(max_output_tokens: int | None) -> int:
+    tokens = max_output_tokens if max_output_tokens is not None and max_output_tokens > 0 else DEFAULT_MAX_OUTPUT_TOKENS
+    return _bounded(tokens * 4, 1024, 1024 * 1024)
+
+
+def _approx_token_count(text: str) -> int:
+    return max(len(text) // 4, len(text.split()))
+
+
+def _chunk_id() -> str:
+    return secrets.token_hex(3)
+
+
+class HeadTailBuffer:
+    """
+    Bounded byte buffer that keeps a stable prefix and suffix while dropping the middle.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max(0, max_bytes)
+        self._head_budget = self._max_bytes // 2
+        self._tail_budget = self._max_bytes - self._head_budget
+        self._head = bytearray()
+        self._tail = bytearray()
+        self._omitted_bytes = 0
+
+    @property
+    def omitted_bytes(self) -> int:
+        return self._omitted_bytes
+
+    def push(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        if self._max_bytes == 0:
+            self._omitted_bytes += len(chunk)
+            return
+
+        remaining = chunk
+        if len(self._head) < self._head_budget:
+            take = min(self._head_budget - len(self._head), len(remaining))
+            self._head.extend(remaining[:take])
+            remaining = remaining[take:]
+
+        if not remaining:
+            return
+
+        if self._tail_budget == 0:
+            self._omitted_bytes += len(remaining)
+            return
+
+        self._tail.extend(remaining)
+        if len(self._tail) > self._tail_budget:
+            excess = len(self._tail) - self._tail_budget
+            del self._tail[:excess]
+            self._omitted_bytes += excess
+
+    def snapshot(self) -> bytes:
+        if self._omitted_bytes:
+            marker = f"\n...[omitted {self._omitted_bytes} bytes from middle]...\n".encode()
+            return bytes(self._head) + marker + bytes(self._tail)
+        return bytes(self._head) + bytes(self._tail)
+
+    def drain(self) -> tuple[bytes, int]:
+        data = self.snapshot()
+        omitted = self._omitted_bytes
+        self._head.clear()
+        self._tail.clear()
+        self._omitted_bytes = 0
+        return data, omitted
+
+
+@dataclass(frozen=True)
+class TerminalResponse:
+    chunk_id: str
+    command: str
+    cwd: str
+    session_id: int | None
+    pid: int
+    running: bool
+    exit_code: int | None
+    duration_ms: int
+    wall_time_seconds: float
+    output: str
+    original_token_count: int
+    omitted_bytes: int
+    log_path: str
+    transport: str
+    timed_out: bool = False
+    pty_requested_but_pipe_used: bool = False
+
+
+class TerminalSession:
+    """
+    Terminal session with Codex-like bounded recent output and a full temp log.
+    """
+
+    def __init__(
+        self,
+        session_id: int,
+        command: str,
+        cwd: Path,
+        process: subprocess.Popen[bytes],
+        output_fd: int,
+        write_fd: int | None,
+        log_path: Path,
+        transport: str,
+        max_output_bytes: int,
+    ) -> None:
+        self.session_id = session_id
+        self.command = command
+        self.cwd = cwd
+        self.process = process
+        self.output_fd = output_fd
+        self.write_fd = write_fd
+        self.log_path = log_path
+        self.transport = transport
+        self.started_at = time.monotonic()
+        self.last_used = self.started_at
+        self._pending_output = HeadTailBuffer(max_output_bytes)
+        self._all_output = HeadTailBuffer(max_output_bytes)
+        self._condition = threading.Condition()
+        self._reader_done = False
+        self._log_file = log_path.open("ab", buffering=0)
+        self._reader_thread = threading.Thread(target=self._read_output, name=f"serena-terminal-{session_id}", daemon=True)
+        self._reader_thread.start()
+
+    def _read_output(self) -> None:
+        try:
+            while True:
+                try:
+                    chunk = os.read(self.output_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                with self._condition:
+                    self._pending_output.push(chunk)
+                    self._all_output.push(chunk)
+                    self._log_file.write(chunk)
+                    self._condition.notify_all()
+        finally:
+            with self._condition:
+                self._reader_done = True
+                self._condition.notify_all()
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            try:
+                os.close(self.output_fd)
+            except OSError:
+                pass
+
+    def _wait_for_yield(self, yield_time_ms: int) -> bool:
+        deadline = time.monotonic() + (yield_time_ms / 1000)
+        while True:
+            if self.process.poll() is not None:
+                self._reader_thread.join(timeout=0.2)
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            with self._condition:
+                self._condition.wait(timeout=min(remaining, 0.05))
+
+    def write(self, chars: str) -> None:
+        if self.process.poll() is not None:
+            raise RuntimeError(f"Terminal session {self.session_id} has already exited")
+        self.last_used = time.monotonic()
+        if self.transport != "pty":
+            if chars == INTERRUPT:
+                self.interrupt()
+                return
+            raise RuntimeError("stdin is closed for non-PTY sessions; start exec_command with tty=true for interactive input")
+        if self.write_fd is None:
+            raise RuntimeError(f"Terminal session {self.session_id} stdin is closed")
+        os.write(self.write_fd, chars.encode())
+
+    def interrupt(self) -> None:
+        if self.process.poll() is not None:
+            return
+        if os.name == "posix":
+            try:
+                os.killpg(self.process.pid, signal.SIGINT)
+                return
+            except OSError:
+                pass
+        self.process.send_signal(signal.SIGINT)
+
+    def collect_response(self, yield_time_ms: int, drain: bool = True) -> TerminalResponse:
+        self.last_used = time.monotonic()
+        timed_out = self._wait_for_yield(yield_time_ms)
+        running = self.process.poll() is None
+        if drain:
+            output_bytes, omitted = self._pending_output.drain()
+        else:
+            output_bytes = self._all_output.snapshot()
+            omitted = self._all_output.omitted_bytes
+        output = output_bytes.decode("utf-8", errors="replace")
+        duration_ms = int((time.monotonic() - self.started_at) * 1000)
+        return TerminalResponse(
+            chunk_id=_chunk_id(),
+            command=self.command,
+            cwd=str(self.cwd),
+            session_id=self.session_id if running else None,
+            pid=self.process.pid,
+            running=running,
+            exit_code=self.process.returncode,
+            duration_ms=duration_ms,
+            wall_time_seconds=duration_ms / 1000,
+            output=output,
+            original_token_count=_approx_token_count(output),
+            omitted_bytes=omitted,
+            log_path=str(self.log_path),
+            transport=self.transport,
+            timed_out=timed_out and running,
+            pty_requested_but_pipe_used=False,
+        )
+
+    def terminate(self) -> None:
+        if self.process.poll() is None:
+            terminate_process_tree_with_kill_fallback(self.process, terminate_timeout=2.0, process_name="Terminal session")
+        if self.write_fd is not None:
+            try:
+                os.close(self.write_fd)
+            except OSError:
+                pass
+
+    def info(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "pid": self.process.pid,
+            "command": self.command,
+            "cwd": str(self.cwd),
+            "transport": self.transport,
+            "running": self.process.poll() is None,
+            "exit_code": self.process.returncode,
+            "duration_ms": int((time.monotonic() - self.started_at) * 1000),
+            "last_used_age_ms": int((time.monotonic() - self.last_used) * 1000),
+            "log_path": str(self.log_path),
+        }
+
+
+class TerminalProcessManager:
+    """
+    Serena-native process/session manager inspired by Codex unified exec.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next_session_id = 1
+        self._sessions: dict[int, TerminalSession] = {}
+
+    def _allocate_session_id(self) -> int:
+        with self._lock:
+            session_id = self._next_session_id
+            self._next_session_id += 1
+            return session_id
+
+    def _register(self, session: TerminalSession) -> None:
+        with self._lock:
+            self._cleanup_exited_locked()
+            if len(self._sessions) >= MAX_LIVE_TERMINAL_SESSIONS:
+                pruned = self._prune_session_locked()
+                if pruned is None:
+                    raise RuntimeError(f"Too many live terminal sessions; maximum is {MAX_LIVE_TERMINAL_SESSIONS}")
+            self._sessions[session.session_id] = session
+
+    def _cleanup_exited_locked(self) -> None:
+        for session_id, session in list(self._sessions.items()):
+            if session.process.poll() is not None:
+                del self._sessions[session_id]
+
+    def _prune_session_locked(self) -> TerminalSession | None:
+        if not self._sessions:
+            return None
+        by_recency = sorted(self._sessions.values(), key=lambda item: item.last_used, reverse=True)
+        protected = {session.session_id for session in by_recency[:PROTECTED_RECENT_TERMINAL_SESSIONS]}
+        lru = sorted(self._sessions.values(), key=lambda item: item.last_used)
+        victim = next((session for session in lru if session.session_id not in protected and session.process.poll() is not None), None)
+        if victim is None:
+            victim = next((session for session in lru if session.session_id not in protected), None)
+        if victim is None:
+            return None
+        self._sessions.pop(victim.session_id, None)
+        victim.terminate()
+        return victim
+
+    def _get(self, session_id: int) -> TerminalSession:
+        with self._lock:
+            session = self._sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"No running terminal session with id {session_id}")
+        return session
+
+    def _unregister_if_exited(self, session: TerminalSession) -> None:
+        if session.process.poll() is None:
+            return
+        with self._lock:
+            self._sessions.pop(session.session_id, None)
+
+    def exec_command(
+        self,
+        command: str,
+        cwd: Path,
+        yield_time_ms: int = DEFAULT_YIELD_TIME_MS,
+        max_output_tokens: int | None = None,
+        shell: str | None = None,
+        login: bool = False,
+        tty: bool = False,
+    ) -> TerminalResponse:
+        session_id = self._allocate_session_id()
+        log_path = Path(tempfile.gettempdir()) / f"serena-exec-{session_id}-{int(time.time() * 1000)}.log"
+        env = os.environ.copy()
+        env.update(UNIFIED_EXEC_ENV)
+
+        shell_path = shell or os.environ.get("SHELL")
+        if shell_path:
+            argv: str | list[str] = [shell_path, "-lc" if login else "-c", command]
+            use_shell = False
+        else:
+            argv = command
+            use_shell = True
+
+        transport = "pty" if tty and os.name == "posix" else "pipe"
+        pty_requested_but_pipe_used = tty and transport != "pty"
+        master_fd: int | None = None
+        slave_fd: int | None = None
+        if transport == "pty":
+            import pty
+
+            master_fd, slave_fd = pty.openpty()
+            process = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                shell=use_shell,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                close_fds=True,
+                start_new_session=True,
+                **subprocess_kwargs(),
+            )
+            os.close(slave_fd)
+            output_fd = master_fd
+            write_fd = master_fd
+        else:
+            process = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                shell=use_shell,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=os.name == "posix",
+                **subprocess_kwargs(),
+            )
+            assert process.stdout is not None
+            output_fd = os.dup(process.stdout.fileno())
+            write_fd = None
+        session = TerminalSession(
+            session_id=session_id,
+            command=command,
+            cwd=cwd,
+            process=process,
+            output_fd=output_fd,
+            write_fd=write_fd,
+            log_path=log_path,
+            transport=transport,
+            max_output_bytes=_max_output_bytes(max_output_tokens),
+        )
+        try:
+            self._register(session)
+        except Exception:
+            session.terminate()
+            raise
+        response = session.collect_response(_bounded(yield_time_ms, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS))
+        if pty_requested_but_pipe_used:
+            response = TerminalResponse(**{**asdict(response), "pty_requested_but_pipe_used": True})
+        self._unregister_if_exited(session)
+        return response
+
+    def write_stdin(
+        self,
+        session_id: int,
+        chars: str = "",
+        yield_time_ms: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> TerminalResponse:
+        session = self._get(session_id)
+        if max_output_tokens is not None:
+            # Apply the requested budget to newly returned output without changing the session's full retained log.
+            session._pending_output = HeadTailBuffer(_max_output_bytes(max_output_tokens))
+        if chars:
+            session.write(chars)
+            effective_yield = DEFAULT_STDIN_YIELD_TIME_MS if yield_time_ms is None else yield_time_ms
+            effective_yield = _bounded(effective_yield, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
+        else:
+            effective_yield = DEFAULT_EMPTY_POLL_YIELD_TIME_MS if yield_time_ms is None else yield_time_ms
+            effective_yield = _bounded(effective_yield, MIN_YIELD_TIME_MS, MAX_EMPTY_POLL_YIELD_TIME_MS)
+        response = session.collect_response(effective_yield)
+        self._unregister_if_exited(session)
+        return response
+
+    def list_sessions(self) -> list[dict[str, object]]:
+        with self._lock:
+            self._cleanup_exited_locked()
+            sessions = sorted(self._sessions.values(), key=lambda item: item.session_id)
+            return [session.info() for session in sessions if session.process.poll() is None]
+
+    def stop_session(self, session_id: int) -> bool:
+        session = self._get(session_id)
+        session.terminate()
+        with self._lock:
+            self._sessions.pop(session_id, None)
+        return True
+
+
+TERMINAL_PROCESS_MANAGER = TerminalProcessManager()
+
+
+def _json_response(response: TerminalResponse) -> str:
+    payload = asdict(response)
+    # Keep Codex's trained output field names first while retaining Serena diagnostics.
+    ordered = {
+        "chunk_id": payload["chunk_id"],
+        "wall_time_seconds": payload["wall_time_seconds"],
+        "exit_code": payload["exit_code"],
+        "session_id": payload["session_id"],
+        "original_token_count": payload["original_token_count"],
+        "output": payload["output"],
+        "command": payload["command"],
+        "cwd": payload["cwd"],
+        "pid": payload["pid"],
+        "running": payload["running"],
+        "duration_ms": payload["duration_ms"],
+        "omitted_bytes": payload["omitted_bytes"],
+        "log_path": payload["log_path"],
+        "transport": payload["transport"],
+        "timed_out": payload["timed_out"],
+        "pty_requested_but_pipe_used": payload["pty_requested_but_pipe_used"],
+    }
+    return json.dumps(ordered, ensure_ascii=False, indent=2)
+
+
+def _resolve_workdir(project_root: str, workdir: str | None) -> Path:
+    if workdir is None or workdir == "":
+        resolved = Path(project_root).resolve()
+    else:
+        candidate = Path(workdir)
+        resolved = candidate.resolve() if candidate.is_absolute() else (Path(project_root) / candidate).resolve()
+
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Working directory does not exist: {resolved}")
+    return resolved
 
 
 class ExecuteShellCommandTool(Tool, ToolMarkerCanEdit):
     """
-    Executes a shell command.
+    Compatibility wrapper around Serena's Codex-style terminal engine.
     """
 
     def apply(
@@ -19,34 +516,123 @@ class ExecuteShellCommandTool(Tool, ToolMarkerCanEdit):
         cwd: str | None = None,
         capture_stderr: bool = True,
         max_answer_chars: int = -1,
+        timeout_seconds: int = 120,
+        background: bool = False,
     ) -> str:
         """
         Execute a shell command and return its output. If there is a memory about suggested commands, read that first.
-        Never execute unsafe shell commands!
-        IMPORTANT: Do not use this tool to start
-          * long-running processes (e.g. servers) that are not intended to terminate quickly,
-          * processes that require user interaction.
+        Prefer `exec_command` for new terminal work and `write_stdin` to continue an ongoing command.
 
         :param command: the shell command to execute
         :param cwd: the working directory to execute the command in. If None, the project root will be used.
-        :param capture_stderr: whether to capture and return stderr output
-        :param max_answer_chars: if the output is longer than this number of characters,
-            no content will be returned. -1 means using the default value, don't adjust unless there is no other way to get the content
-            required for the task.
-        :return: a JSON object containing the command's stdout and optionally stderr output
+        :param capture_stderr: kept for compatibility; stderr is merged into the bounded terminal output.
+        :param max_answer_chars: maximum JSON response length; -1 uses the configured default.
+        :param timeout_seconds: initial wait before returning a session for longer-running commands.
+        :param background: if true, return quickly with a session ID for the running command.
+        :return: a JSON object containing command metadata, bounded output, exit code, and session/log information
         """
-        if cwd is None:
-            _cwd = self.get_project_root()
-        else:
-            if os.path.isabs(cwd):
-                _cwd = cwd
-            else:
-                _cwd = os.path.join(self.get_project_root(), cwd)
-                if not os.path.isdir(_cwd):
-                    raise FileNotFoundError(
-                        f"Specified a relative working directory ({cwd}), but the resulting path is not a directory: {_cwd}"
-                    )
+        del capture_stderr
+        workdir = _resolve_workdir(self.get_project_root(), cwd)
+        yield_time_ms = MIN_YIELD_TIME_MS if background else _bounded(timeout_seconds * 1000, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
+        response = TERMINAL_PROCESS_MANAGER.exec_command(command=command, cwd=workdir, yield_time_ms=yield_time_ms)
+        return self._limit_length(_json_response(response), max_answer_chars)
 
-        result = execute_shell_command(command, cwd=_cwd, capture_stderr=capture_stderr)
-        result = result.json()
-        return self._limit_length(result, max_answer_chars)
+
+class ExecCommandTool(Tool, ToolMarkerCanEdit):
+    """
+    Runs a command locally, returning bounded output or a session ID for ongoing interaction.
+    """
+
+    def apply(
+        self,
+        cmd: str,
+        workdir: str | None = None,
+        yield_time_ms: int = DEFAULT_YIELD_TIME_MS,
+        max_output_tokens: int | None = None,
+        shell: str | None = None,
+        login: bool = False,
+        tty: bool = False,
+    ) -> str:
+        """
+        Run a shell command with Codex-style bounded output and session handling.
+
+        :param cmd: shell command to execute
+        :param workdir: working directory for the command. Relative paths resolve inside the active project root.
+        :param yield_time_ms: wait before yielding output. Defaults to 10000 ms and is capped to 250-30000 ms.
+        :param max_output_tokens: approximate output budget. Defaults to 10000 tokens.
+        :param shell: shell binary to use. Defaults to the user's SHELL when available.
+        :param login: run the shell with login semantics when supported by the selected shell.
+        :param tty: request a PTY. Serena currently uses pipe transport and reports this in the response.
+        :return: JSON terminal response with output, exit code or session ID, and temp log path
+        """
+        workdir_path = _resolve_workdir(self.get_project_root(), workdir)
+        response = TERMINAL_PROCESS_MANAGER.exec_command(
+            command=cmd,
+            cwd=workdir_path,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+            shell=shell,
+            login=login,
+            tty=tty,
+        )
+        return _json_response(response)
+
+
+class WriteStdinTool(Tool, ToolMarkerCanEdit):
+    """
+    Writes to or polls an existing `exec_command` terminal session.
+    """
+
+    def apply(
+        self,
+        session_id: int,
+        chars: str = "",
+        yield_time_ms: int | None = None,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        """
+        Write characters to an existing terminal session and return recent bounded output.
+
+        :param session_id: session identifier returned by `exec_command`
+        :param chars: bytes/characters to write to stdin. Empty string polls without writing.
+        :param yield_time_ms: wait before yielding output. Non-empty writes default to 250 ms; empty polls default to 5000 ms.
+        :param max_output_tokens: approximate output budget for this response. Defaults to 10000 tokens.
+        :return: JSON terminal response with recent output, exit status, and continuing session ID if still running
+        """
+        response = TERMINAL_PROCESS_MANAGER.write_stdin(
+            session_id=session_id,
+            chars=chars,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
+        return _json_response(response)
+
+
+class ListTerminalSessionsTool(Tool):
+    """
+    Lists running `exec_command` terminal sessions.
+    """
+
+    def apply(self) -> str:
+        """
+        Return currently running terminal sessions.
+
+        :return: JSON list of running terminal sessions
+        """
+        return json.dumps({"sessions": TERMINAL_PROCESS_MANAGER.list_sessions()}, ensure_ascii=False, indent=2)
+
+
+class StopTerminalSessionTool(Tool, ToolMarkerCanEdit):
+    """
+    Stops a running `exec_command` terminal session.
+    """
+
+    def apply(self, session_id: int) -> str:
+        """
+        Terminate a running terminal session and remove it from the session registry.
+
+        :param session_id: session identifier returned by `exec_command`
+        :return: JSON stop result
+        """
+        stopped = TERMINAL_PROCESS_MANAGER.stop_session(session_id)
+        return json.dumps({"session_id": session_id, "stopped": stopped}, ensure_ascii=False, indent=2)

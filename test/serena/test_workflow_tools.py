@@ -1,0 +1,139 @@
+from pathlib import Path
+
+from serena.tools.tools_base import ToolRegistry
+from serena.tools.workflow_tools import (
+    MAX_GOAL_OBJECTIVE_CHARS,
+    _goal_public_state,
+    _goal_response,
+    _goal_state_path,
+    _infer_validation_hints,
+    _load_instruction_documents,
+    _resolve_focus_dir,
+    _save_goal_state,
+    _validate_goal_objective,
+)
+
+
+def test_coding_workflow_tools_are_registered() -> None:
+    names = ToolRegistry().get_tool_names()
+
+    assert "prepare_coding_task" in names
+    assert "get_coding_harness_instructions" in names
+    assert "get_validation_commands" in names
+    assert "finalize_coding_task" in names
+    assert "get_goal" in names
+    assert "create_goal" in names
+    assert "update_goal" in names
+    assert "record_goal_progress" in names
+    assert "summarize_goal_for_new_chat" in names
+
+
+def test_load_instruction_documents_prefers_override_and_preserves_scope_order(tmp_path: Path) -> None:
+    project_root = tmp_path
+    focus_dir = project_root / "src" / "feature"
+    focus_dir.mkdir(parents=True)
+    (project_root / "AGENTS.md").write_text("root instructions", encoding="utf-8")
+    (project_root / "src" / "AGENTS.md").write_text("ignored default", encoding="utf-8")
+    (project_root / "src" / "AGENTS.override.md").write_text("src override", encoding="utf-8")
+    (focus_dir / "AGENTS.md").write_text("feature instructions", encoding="utf-8")
+
+    documents = _load_instruction_documents(project_root, focus_dir, max_total_bytes=65536)
+
+    assert [document.relative_path for document in documents] == [
+        "AGENTS.md",
+        "src/AGENTS.override.md",
+        "src/feature/AGENTS.md",
+    ]
+    assert [document.contents for document in documents] == ["root instructions", "src override", "feature instructions"]
+
+
+def test_load_instruction_documents_truncates_to_byte_budget(tmp_path: Path) -> None:
+    project_root = tmp_path
+    (project_root / "AGENTS.md").write_text("123456789", encoding="utf-8")
+
+    documents = _load_instruction_documents(project_root, project_root, max_total_bytes=4)
+
+    assert len(documents) == 1
+    assert documents[0].contents == "1234"
+    assert documents[0].truncated is True
+
+
+def test_resolve_focus_dir_rejects_paths_outside_project(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside"
+
+    try:
+        _resolve_focus_dir(tmp_path, f"../{outside.name}")
+    except ValueError as e:
+        assert "inside the active project" in str(e)
+    else:
+        raise AssertionError("Expected focus path outside the project to be rejected")
+
+
+def test_infer_validation_hints_detects_python_and_node_commands(tmp_path: Path) -> None:
+    (tmp_path / "uv.lock").write_text("", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[tool.poe.tasks]
+lint = "ruff check src test"
+test = "pytest test"
+""".strip(),
+        encoding="utf-8",
+    )
+    (tmp_path / "pnpm-lock.yaml").write_text("", encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"lint": "eslint .", "test": "vitest", "build": "vite build"}}',
+        encoding="utf-8",
+    )
+
+    hints = _infer_validation_hints(tmp_path)
+
+    assert hints.package_files == ["pyproject.toml", "uv.lock", "package.json", "pnpm-lock.yaml"]
+    assert hints.detected_package_managers == ["uv", "pnpm"]
+    assert hints.likely_commands == ["uv run poe lint", "uv run poe test", "pnpm lint", "pnpm test", "pnpm build"]
+
+
+def test_goal_objective_validation_matches_codex_limits() -> None:
+    _validate_goal_objective("ship the thing")
+
+    try:
+        _validate_goal_objective("")
+    except ValueError as e:
+        assert "must not be empty" in str(e)
+    else:
+        raise AssertionError("Expected empty goal objective to be rejected")
+
+    try:
+        _validate_goal_objective("x" * (MAX_GOAL_OBJECTIVE_CHARS + 1))
+    except ValueError as e:
+        assert "at most" in str(e)
+    else:
+        raise AssertionError("Expected overlong goal objective to be rejected")
+
+
+def test_goal_public_state_and_response_include_remaining_budget(tmp_path: Path) -> None:
+    _save_goal_state(
+        tmp_path,
+        {
+            "objective": "finish harness",
+            "status": "active",
+            "token_budget": 100,
+            "tokens_used": 25,
+            "time_used_seconds": 0,
+            "created_at": "2026-06-24T00:00:00Z",
+            "updated_at": "2026-06-24T00:00:00Z",
+            "progress": [],
+        },
+    )
+
+    public = _goal_public_state(tmp_path)
+    assert public is not None
+    assert public["state_path"] == str(_goal_state_path(tmp_path))
+    assert public["remaining_tokens"] == 75
+
+    response = _goal_response(public, include_completion_report=True)
+    assert response["remaining_tokens"] == 75
+    assert "tokens_used=25" in response["completion_budget_report"]
+    assert response["runtime_prompts"]["continuation"].startswith('<codex_internal_context source="serena_goal_continuation">')
+    assert "<objective>\nfinish harness\n</objective>" in response["runtime_prompts"]["continuation"]
+    assert "Tokens remaining: 75" in response["runtime_prompts"]["objective_updated"]
+    assert "Time spent pursuing goal:" in response["runtime_prompts"]["budget_limit"]
