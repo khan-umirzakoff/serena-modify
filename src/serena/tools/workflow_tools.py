@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from serena.tools import Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
-from serena.tools.task_catalog import TaskCatalog, ValidationHints, discover_task_catalog, infer_validation_hints
+from serena.tools.task_catalog import VALIDATION_KINDS, TaskCatalog, ValidationHints, discover_task_catalog, infer_validation_hints
 
 
 @dataclass(frozen=True)
@@ -47,9 +47,9 @@ class CodingTaskSnapshot:
     instruction_documents: list[ProjectInstructionDocument]
     validation_hints: ValidationHints
     task_catalog_summary: dict[str, Any]
-    task_catalog: TaskCatalog
+    task_catalog: dict[str, Any]
     active_goal: dict[str, Any] | None
-    active_goal_runtime_prompts: dict[str, str] | None
+    active_goal_runtime_prompts: dict[str, Any] | None
     active_plan: dict[str, Any] | None
     git_status: CommandSnapshot
     git_diff_stat: CommandSnapshot
@@ -268,6 +268,24 @@ def _goal_public_state(project_root: Path) -> dict[str, Any] | None:
     return state
 
 
+def _compact_goal_public_state(project_root: Path) -> dict[str, Any] | None:
+    """
+    Return the active goal fields useful in a coding task snapshot.
+
+    :param project_root: active project root
+    :return: compact goal state, or None if no goal is active
+    """
+    state = _goal_public_state(project_root)
+    if state is None:
+        return None
+    return {
+        "objective": state.get("objective"),
+        "status": state.get("status"),
+        "remaining_tokens": state.get("remaining_tokens"),
+        "time_used_seconds": state.get("time_used_seconds"),
+    }
+
+
 def _goal_response(goal: dict[str, Any] | None, include_completion_report: bool = False) -> dict[str, Any]:
     report = None
     if include_completion_report and goal is not None and goal.get("token_budget") is not None:
@@ -324,6 +342,23 @@ def _plan_public_state(project_root: Path) -> dict[str, Any] | None:
     state = dict(state)
     state["state_path"] = str(_plan_state_path(project_root))
     return state
+
+
+def _compact_plan_public_state(project_root: Path) -> dict[str, Any] | None:
+    """
+    Return active plan fields useful in a coding task snapshot.
+
+    :param project_root: active project root
+    :return: compact plan state, or None if no plan is active
+    """
+    state = _plan_public_state(project_root)
+    if state is None:
+        return None
+    return {
+        "updated_at": state.get("updated_at"),
+        "explanation": state.get("explanation"),
+        "plan": state.get("plan"),
+    }
 
 
 def _validate_plan(plan: list[dict[str, Any]]) -> None:
@@ -651,6 +686,72 @@ def _infer_validation_hints(project_root: Path) -> ValidationHints:
     :return: likely validation commands and source files
     """
     return infer_validation_hints(project_root)
+
+
+def _compact_task_dict(task: Any) -> dict[str, Any]:
+    """
+    Return the minimal task fields an agent needs to choose or run a task.
+
+    :param task: discovered project task
+    :return: compact task dictionary
+    """
+    return {
+        "task_id": task.task_id,
+        "kind": task.kind,
+        "command": task.command,
+        "workdir": task.workdir,
+        "long_running": task.long_running,
+    }
+
+
+def _task_catalog_agent_view(
+    full_catalog: TaskCatalog,
+    returned_catalog: TaskCatalog,
+    *,
+    include_details: bool = False,
+) -> dict[str, Any]:
+    """
+    Return a compact task catalog view for model-facing responses.
+
+    :param full_catalog: complete discovered task catalog
+    :param returned_catalog: filtered catalog whose tasks may be returned
+    :param include_details: whether full package file and validation detail should be included
+    :return: model-facing task catalog view
+    """
+    compact_summary = full_catalog.summary()
+    task_count = int(compact_summary["task_count"])
+    omitted_task_count = max(0, task_count - len(returned_catalog.tasks))
+
+    view: dict[str, Any] = {
+        "summary": {
+            **compact_summary,
+            "returned_task_count": len(returned_catalog.tasks),
+            "omitted_task_count": omitted_task_count,
+        },
+        "top_tasks": [_compact_task_dict(task) for task in returned_catalog.tasks],
+        "details_available": bool(omitted_task_count or full_catalog.package_files),
+    }
+
+    if include_details:
+        view["catalog"] = asdict(returned_catalog)
+
+    return view
+
+
+def _compact_validation_hints(catalog: TaskCatalog, max_commands: int = 12) -> ValidationHints:
+    """
+    Return validation hints without manifest path noise.
+
+    :param catalog: filtered task catalog used for model-facing validation hints
+    :param max_commands: maximum likely commands to include
+    :return: compact validation hints
+    """
+    commands = [task.command for task in catalog.tasks if task.kind in VALIDATION_KINDS]
+    return ValidationHints(
+        package_files=[],
+        detected_package_managers=catalog.detected_package_managers,
+        likely_commands=commands[:max_commands],
+    )
 
 
 def _active_serena_state(agent: Any) -> tuple[str, list[str], list[str]]:
@@ -997,12 +1098,12 @@ class PrepareCodingTaskTool(Tool):
             modes=modes,
             active_tools=active_tools,
             instruction_documents=instruction_documents,
-            validation_hints=task_catalog.validation_hints,
+            validation_hints=_compact_validation_hints(task_catalog),
             task_catalog_summary=full_task_catalog.summary(),
-            task_catalog=task_catalog,
-            active_goal=_goal_public_state(project_root),
-            active_goal_runtime_prompts=_goal_runtime_prompts(_goal_public_state(project_root)),
-            active_plan=_plan_public_state(project_root),
+            task_catalog=_task_catalog_agent_view(full_task_catalog, task_catalog, include_details=False),
+            active_goal=_compact_goal_public_state(project_root),
+            active_goal_runtime_prompts=None,
+            active_plan=_compact_plan_public_state(project_root),
             git_status=_run_git_snapshot(project_root, ["status", "--short"]),
             git_diff_stat=_run_git_snapshot(project_root, ["diff", "--stat"]),
         )
@@ -1144,6 +1245,7 @@ class DiscoverProjectTasksTool(Tool):
         include_examples: bool = False,
         include_ignored: bool = False,
         max_tasks: int = 30,
+        include_details: bool = False,
     ) -> str:
         """
         Return the universal project task catalog.
@@ -1154,6 +1256,7 @@ class DiscoverProjectTasksTool(Tool):
         :param include_examples: whether example, sample, and demo manifests should be included
         :param include_ignored: whether generated/dependency/cache directories should be scanned
         :param max_tasks: maximum number of tasks to include in the task list; set to 0 for none
+        :param include_details: whether full package files and validation hints should be returned
         :return: JSON project task catalog
         """
         active_project = self.agent.get_active_project_or_raise()
@@ -1166,17 +1269,18 @@ class DiscoverProjectTasksTool(Tool):
             include_ignored=include_ignored,
         )
         visible_catalog = catalog.filtered(include_internal=include_internal, max_tasks=max_tasks)
-        response = {
-            "summary": catalog.summary(),
-            "filtered": {
-                "include_internal": include_internal,
-                "include_fixtures": include_fixtures,
-                "include_examples": include_examples,
-                "include_ignored": include_ignored,
-                "max_tasks": max_tasks,
-                "returned_task_count": len(visible_catalog.tasks),
-            },
-            "catalog": asdict(visible_catalog),
+        response = _task_catalog_agent_view(
+            catalog,
+            visible_catalog,
+            include_details=include_details,
+        )
+        response["filtered"] = {
+            "include_internal": include_internal,
+            "include_fixtures": include_fixtures,
+            "include_examples": include_examples,
+            "include_ignored": include_ignored,
+            "max_tasks": max_tasks,
+            "include_details": include_details,
         }
         return json.dumps(response, ensure_ascii=False, indent=2)
 

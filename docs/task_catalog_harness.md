@@ -56,7 +56,7 @@ Task IDs include runner information to avoid collisions, for example:
 
 ## Tool flow
 
-- `discover_project_tasks(include_internal=false, include_fixtures=false, include_examples=false, include_ignored=false, max_tasks=30)` returns a summary plus a bounded public catalog by default.
+- `discover_project_tasks(include_internal=false, include_fixtures=false, include_examples=false, include_ignored=false, max_tasks=30, include_details=false)` returns only summary plus bounded `top_tasks` by default; full package files and validation hint detail are opt-in.
 - `discover_project_tasks(include_internal=true)` is reserved for debugging or advanced agent use when helper tasks are needed.
 - `discover_project_tasks(include_fixtures=true, include_examples=true)` is reserved for explicit inspection of test fixtures, samples, demos, and example projects.
 - `discover_project_tasks(include_ignored=true)` is a last-resort diagnostic option for generated, dependency, cache, or normally ignored directories.
@@ -75,7 +75,7 @@ The catalog is intentionally summary-first and root-first:
 - generated, dependency, cache, and vendor directories are excluded by default;
 - root/workspace tasks sort ahead of nested manifests when explicit broader discovery is enabled;
 - public validation tasks such as `typecheck`, `lint`, `test`, `format`, and `build` sort before generic tasks;
-- full catalogs remain available only through explicit discovery arguments.
+- package file lists, validation hint detail, and full filtered catalogs remain available only with `include_details=true`.
 
 ## Future versions
 

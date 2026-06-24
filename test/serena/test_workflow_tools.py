@@ -5,6 +5,7 @@ from serena.tools.tools_base import ToolRegistry
 from serena.tools.workflow_tools import (
     MAX_GOAL_OBJECTIVE_CHARS,
     _apply_codex_style_patch,
+    _compact_validation_hints,
     _format_plan_markdown,
     _goal_public_state,
     _goal_response,
@@ -14,6 +15,7 @@ from serena.tools.workflow_tools import (
     _resolve_focus_dir,
     _resolve_review_target,
     _save_goal_state,
+    _task_catalog_agent_view,
     _validate_goal_objective,
     _validate_plan,
 )
@@ -143,6 +145,38 @@ def test_task_catalog_filtered_view_hides_internal_tasks_and_prefers_root_tasks(
 
     catalog_with_fixtures = discover_task_catalog(tmp_path, include_fixtures=True)
     assert any("test/resources" in package_file for package_file in catalog_with_fixtures.package_files)
+
+
+def test_task_catalog_agent_view_is_compact_by_default(tmp_path: Path) -> None:
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"lint": "eslint .", "test": "vitest", "build": "vite build"}}',
+        encoding="utf-8",
+    )
+    nested = tmp_path / "apps" / "web"
+    nested.mkdir(parents=True)
+    (nested / "package.json").write_text(
+        '{"scripts": {"lint": "eslint app", "build": "vite build"}}',
+        encoding="utf-8",
+    )
+
+    catalog = discover_task_catalog(tmp_path)
+    visible = catalog.filtered(max_tasks=2)
+
+    view = _task_catalog_agent_view(catalog, visible)
+    hints = _compact_validation_hints(visible)
+
+    assert set(view) == {"summary", "top_tasks", "details_available"}
+    assert "catalog" not in view
+    assert "package_files" not in view
+    assert len(view["top_tasks"]) == 2
+    assert set(view["top_tasks"][0]) == {"task_id", "kind", "command", "workdir", "long_running"}
+    assert view["summary"]["package_files_count"] == 2
+    assert hints.package_files == []
+    assert hints.likely_commands
+
+    detailed_view = _task_catalog_agent_view(catalog, visible, include_details=True)
+    assert "catalog" in detailed_view
+    assert detailed_view["catalog"]["package_files"] == ["package.json", "apps/web/package.json"]
 
 
 def test_goal_objective_validation_matches_codex_limits() -> None:

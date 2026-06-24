@@ -5,7 +5,7 @@ Serena MCP should reduce ChatGPT tool-call filter issues by making common projec
 ## Current v1 design
 
 - `src/serena/tools/task_catalog.py` owns the task discovery engine.
-- `discover_project_tasks` exposes the catalog as a tool.
+- `discover_project_tasks` exposes a compact catalog view as a tool: summary plus bounded `top_tasks` by default; full package files, validation hint detail, and full filtered catalog require `include_details=true`.
 - `run_task(task_id)` executes a discovered task through the existing Codex-style terminal manager.
 - `get_validation_commands` remains a backward-compatible wrapper around catalog validation hints.
 - `prepare_coding_task` includes `task_catalog_summary` plus a small public top-task list, so the agent can choose safe tasks early without dumping every command.
