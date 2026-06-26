@@ -18,6 +18,8 @@ def test_exec_command_tool_and_write_stdin_tool_are_registered() -> None:
     assert "exec_command" in names
     assert "write_stdin" in names
     assert "list_terminal_sessions" in names
+    assert "terminal_status" in names
+    assert "send_terminal_signal" in names
     assert "stop_terminal_session" in names
 
 
@@ -113,6 +115,26 @@ def test_write_stdin_interrupts_pipe_session(tmp_path: Path) -> None:
     assert second.exit_code != 0
 
 
+def test_send_signal_interrupts_pipe_session(tmp_path: Path) -> None:
+    manager = TerminalProcessManager()
+    command = _python_command(
+        "import signal, time; "
+        "signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt)); "
+        "print('ready', flush=True); "
+        "time.sleep(10)"
+    )
+
+    first = manager.exec_command(command, cwd=tmp_path, yield_time_ms=250)
+
+    assert first.session_id is not None
+    assert "ready" in first.output
+    sent_signal, second = manager.send_signal(first.session_id, signal_name="int", yield_time_ms=1000)
+
+    assert sent_signal == "SIGINT"
+    assert second.running is False
+    assert second.exit_code != 0
+
+
 def test_huge_output_is_bounded(tmp_path: Path) -> None:
     manager = TerminalProcessManager()
     command = _python_command("print('START' + ('x' * 20000) + 'END')")
@@ -155,6 +177,12 @@ def test_list_and_stop_terminal_sessions(tmp_path: Path) -> None:
     sessions = manager.list_sessions()
     assert [session["session_id"] for session in sessions] == [first.session_id]
     assert sessions[0]["transport"] == "pty"
+
+    status = manager.session_status(first.session_id, include_output=True)
+    assert status["session_id"] == first.session_id
+    assert status["running"] is True
+    assert status["transport"] == "pty"
+    assert "ready" in str(status["output"])
 
     assert manager.stop_session(first.session_id) is True
     assert manager.list_sessions() == []

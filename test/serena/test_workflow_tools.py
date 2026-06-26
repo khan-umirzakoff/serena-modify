@@ -6,15 +6,18 @@ from serena.tools.workflow_tools import (
     MAX_GOAL_OBJECTIVE_CHARS,
     _apply_codex_style_patch,
     _compact_validation_hints,
+    _edit_policy_contract,
     _format_plan_markdown,
     _goal_public_state,
     _goal_response,
     _goal_state_path,
     _infer_validation_hints,
     _load_instruction_documents,
+    _normalize_validation_id,
     _resolve_focus_dir,
     _resolve_review_target,
     _save_goal_state,
+    _select_validation_task,
     _task_catalog_agent_view,
     _validate_goal_objective,
     _validate_plan,
@@ -30,6 +33,7 @@ def test_coding_workflow_tools_are_registered() -> None:
     assert "get_validation_commands" in names
     assert "discover_project_tasks" in names
     assert "run_task" in names
+    assert "run_validation" in names
     assert "finalize_coding_task" in names
     assert "update_plan" in names
     assert "prepare_review_task" in names
@@ -303,6 +307,20 @@ def test_planning_mode_no_longer_disables_editing_tools() -> None:
     assert "read-only planning mode" in contents
 
 
+def test_edit_policy_prefers_semantic_then_exact_then_patch() -> None:
+    policy = _edit_policy_contract()
+
+    assert policy["default_order"] == [
+        "inspect before editing unfamiliar code",
+        "symbol tools for symbol-aware changes",
+        "replace_content for exact small text edits with allow_multiple_occurrences=false",
+        "apply_patch for atomic multi-file or structured textual patches",
+    ]
+    assert "not the default small-edit tool" in policy["apply_patch"]["role"]
+    assert policy["apply_patch"]["failure_contract"] == "on failure no patch changes are written and changes=[]"
+    assert "allow_multiple_occurrences=false" in policy["replace_content"]["safety"]
+
+
 def test_apply_patch_add_update_move_and_delete(tmp_path: Path) -> None:
     add_result = _apply_codex_style_patch(
         tmp_path,
@@ -398,3 +416,98 @@ def test_apply_patch_rejects_ambiguous_update_hunks(tmp_path: Path) -> None:
     assert result.success is False
     assert "matched multiple locations" in result.errors[0]
     assert target.read_text(encoding="utf-8") == "same\nsame\n"
+
+
+def test_apply_patch_multifile_success_is_atomic(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("one\n", encoding="utf-8")
+
+    result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Update File: a.txt
+@@
+-one
++two
+*** Add File: b.txt
++created
+*** End Patch""",
+        dry_run=False,
+    )
+
+    assert result.success is True
+    assert result.atomic is True
+    assert result.would_change == ["a.txt", "b.txt"]
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "two\n"
+    assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "created\n"
+
+
+def test_apply_patch_failure_does_not_partially_write(tmp_path: Path) -> None:
+    first = tmp_path / "first.txt"
+    first.write_text("old\n", encoding="utf-8")
+
+    result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Update File: first.txt
+@@
+-old
++new
+*** Update File: missing.txt
+@@
+-missing
++changed
+*** End Patch""",
+        dry_run=False,
+    )
+
+    assert result.success is False
+    assert result.atomic is True
+    assert result.changes == []
+    assert first.read_text(encoding="utf-8") == "old\n"
+    assert not (tmp_path / "missing.txt").exists()
+
+
+def test_apply_patch_dry_run_multifile_does_not_write(tmp_path: Path) -> None:
+    existing = tmp_path / "existing.txt"
+    remove_me = tmp_path / "remove-me.txt"
+    existing.write_text("before\n", encoding="utf-8")
+    remove_me.write_text("delete\n", encoding="utf-8")
+
+    result = _apply_codex_style_patch(
+        tmp_path,
+        ".",
+        """*** Begin Patch
+*** Update File: existing.txt
+@@
+-before
++after
+*** Add File: created.txt
++created
+*** Delete File: remove-me.txt
+*** End Patch""",
+        dry_run=True,
+    )
+
+    assert result.success is True
+    assert result.atomic is True
+    assert existing.read_text(encoding="utf-8") == "before\n"
+    assert remove_me.read_text(encoding="utf-8") == "delete\n"
+    assert not (tmp_path / "created.txt").exists()
+
+
+def test_select_validation_task_accepts_shortcuts(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.poe.tasks]\nlint = 'ruff check .'\ntest = 'pytest'\ntype-check = 'mypy .'\n",
+        encoding="utf-8",
+    )
+
+    catalog = discover_task_catalog(tmp_path).filtered(include_internal=False, max_tasks=10000)
+
+    assert _normalize_validation_id("type-check") == "typecheck"
+    assert _select_validation_task(catalog, "lint").task_id == "root:poe:lint:lint"
+    assert _select_validation_task(catalog, "tests").task_id == "root:poe:test:test"
+    assert _select_validation_task(catalog, "type").kind == "typecheck"
+    assert _select_validation_task(catalog, "root:poe:lint:lint").kind == "lint"
+    assert _select_validation_task(catalog, "missing") is None

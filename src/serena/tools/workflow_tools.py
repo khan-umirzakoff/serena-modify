@@ -45,6 +45,7 @@ class CodingTaskSnapshot:
     modes: list[str]
     active_tools: list[str]
     instruction_documents: list[ProjectInstructionDocument]
+    edit_policy: dict[str, Any]
     validation_hints: ValidationHints
     task_catalog_summary: dict[str, Any]
     task_catalog: dict[str, Any]
@@ -738,6 +739,95 @@ def _task_catalog_agent_view(
     return view
 
 
+def _normalize_validation_id(validation_id: str) -> str:
+    """
+    Normalize validation shortcuts to task catalog kinds.
+
+    :param validation_id: user-facing validation shortcut or task id
+    :return: normalized shortcut
+    """
+    normalized = validation_id.strip().lower().replace("_", "-")
+    aliases = {
+        "type-check": "typecheck",
+        "type": "typecheck",
+        "types": "typecheck",
+        "tests": "test",
+        "unit": "test",
+        "unit-test": "test",
+        "unit-tests": "test",
+        "fmt": "format",
+        "format-check": "format",
+        "check-format": "format",
+        "checks": "check",
+        "verify-all": "verify",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _select_validation_task(catalog: TaskCatalog, validation_id: str) -> Any | None:
+    """
+    Select the best matching validation task from a catalog.
+
+    :param catalog: filtered task catalog
+    :param validation_id: validation kind, alias, command name, or exact task id
+    :return: matching task or None
+    """
+    normalized = _normalize_validation_id(validation_id)
+    if not normalized:
+        return None
+
+    for task in catalog.tasks:
+        if task.task_id == validation_id or task.task_id == normalized:
+            return task
+
+    for task in catalog.tasks:
+        if task.kind == normalized:
+            return task
+
+    for task in catalog.tasks:
+        task_name = task.task_id.rsplit(":", 1)[-1].lower().replace("_", "-")
+        if task.kind in VALIDATION_KINDS and task_name == normalized:
+            return task
+
+    for task in catalog.tasks:
+        if task.kind in VALIDATION_KINDS and normalized in task.task_id.lower():
+            return task
+
+    return None
+
+
+def _edit_policy_contract() -> dict[str, Any]:
+    """
+    Return the compact edit-tool policy agents should follow.
+
+    :return: ordered edit policy contract
+    """
+    return {
+        "default_order": [
+            "inspect before editing unfamiliar code",
+            "symbol tools for symbol-aware changes",
+            "replace_content for exact small text edits with allow_multiple_occurrences=false",
+            "apply_patch for atomic multi-file or structured textual patches",
+        ],
+        "apply_patch": {
+            "role": "atomic multi-file or structured textual edit tool, not the default small-edit tool",
+            "dry_run": "use dry_run=true first for complex or risky patches",
+            "failure_contract": "on failure no patch changes are written and changes=[]",
+        },
+        "replace_content": {
+            "role": "exact small text replacement",
+            "safety": "keep allow_multiple_occurrences=false unless every match was inspected",
+            "precheck": "use search_for_pattern before broad regex or multi-occurrence edits",
+        },
+        "semantic_tools": ["replace_symbol_body", "insert_before_symbol", "insert_after_symbol", "rename_symbol", "safe_delete_symbol"],
+        "guardrails": [
+            "preserve unrelated user changes",
+            "do not overwrite whole files when a smaller edit is enough",
+            "reject ambiguous edits and inspect before retrying",
+        ],
+    }
+
+
 def _compact_validation_hints(catalog: TaskCatalog, max_commands: int = 12) -> ValidationHints:
     """
     Return validation hints without manifest path noise.
@@ -785,9 +875,11 @@ class ApplyPatchResult:
 
     success: bool
     dry_run: bool
+    atomic: bool
     summary: str
     changes: list[ApplyPatchChangeSummary]
     errors: list[str]
+    would_change: list[str]
 
 
 @dataclass(frozen=True)
@@ -1009,27 +1101,124 @@ def _apply_parsed_patch_operation(
 
 
 def _apply_codex_style_patch(project_root: Path, relative_workdir: str, patch: str, dry_run: bool) -> ApplyPatchResult:
-    """Apply a Codex-style patch and return a bounded structured result."""
+    """Apply a Codex-style patch as an all-or-nothing transaction."""
     changes: list[ApplyPatchChangeSummary] = []
+    staged_content: dict[Path, str | None] = {}
+
+    def exists_in_stage(path: Path) -> bool:
+        if path in staged_content:
+            return staged_content[path] is not None
+        return path.exists()
+
+    def read_from_stage(path: Path) -> str:
+        if path in staged_content:
+            content = staged_content[path]
+            if content is None:
+                raise ValueError(f"Cannot read deleted file: {_relative_patch_path(project_root, path)}")
+            return content
+        return path.read_text(encoding="utf-8")
+
+    def stage_operation(operation: _ParsedPatchOperation) -> ApplyPatchChangeSummary:
+        target = _resolve_patch_path(project_root, relative_workdir, operation.path)
+        relative_target = _relative_patch_path(project_root, target)
+
+        if operation.operation == "add":
+            if exists_in_stage(target):
+                raise ValueError(f"Cannot add file that already exists: {relative_target}")
+            content = "\n".join(operation.lines)
+            if operation.lines:
+                content += "\n"
+            staged_content[target] = content
+            return ApplyPatchChangeSummary("add", relative_target, line_count=len(operation.lines))
+
+        if operation.operation == "delete":
+            if not exists_in_stage(target):
+                raise ValueError(f"Cannot delete missing file: {relative_target}")
+            content = read_from_stage(target)
+            staged_content[target] = None
+            return ApplyPatchChangeSummary("delete", relative_target, line_count=len(content.splitlines()))
+
+        if operation.operation == "update":
+            if not exists_in_stage(target):
+                raise ValueError(f"Cannot update missing file: {relative_target}")
+            original = read_from_stage(target)
+            updated = _apply_patch_update_text(original, operation.lines)
+            move_target = None
+            if operation.move_path is not None:
+                move_target = _resolve_patch_path(project_root, relative_workdir, operation.move_path)
+                if move_target != target and exists_in_stage(move_target):
+                    raise ValueError(f"Cannot move to existing file: {_relative_patch_path(project_root, move_target)}")
+
+            if move_target is not None and move_target != target:
+                staged_content[target] = None
+                staged_content[move_target] = updated
+            else:
+                staged_content[target] = updated
+
+            return ApplyPatchChangeSummary(
+                "update",
+                relative_target,
+                move_path=_relative_patch_path(project_root, move_target) if move_target is not None else None,
+                line_count=len(updated.splitlines()),
+            )
+
+        raise ValueError(f"Unsupported patch operation: {operation.operation}")
+
     try:
         operations = _parse_apply_patch_operations(patch)
         for operation in operations:
-            changes.append(_apply_parsed_patch_operation(project_root, relative_workdir, operation, dry_run))
+            changes.append(stage_operation(operation))
     except Exception as error:
         return ApplyPatchResult(
             success=False,
             dry_run=dry_run,
-            summary=f"patch failed: {error}",
-            changes=changes,
+            atomic=True,
+            summary=f"patch failed before writing: {error}",
+            changes=[],
             errors=[str(error)],
+            would_change=sorted({_relative_patch_path(project_root, path) for path in staged_content}),
         )
+
+    would_change = sorted({_relative_patch_path(project_root, path) for path in staged_content})
+
+    if not dry_run:
+        snapshots: dict[Path, bytes | None] = {}
+        for path in staged_content:
+            snapshots[path] = path.read_bytes() if path.exists() else None
+        try:
+            for path, content in staged_content.items():
+                if content is not None:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(content, encoding="utf-8")
+            for path, content in staged_content.items():
+                if content is None and path.exists():
+                    path.unlink()
+        except Exception as error:
+            for path, original_content in snapshots.items():
+                if original_content is None:
+                    if path.exists():
+                        path.unlink()
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(original_content)
+            return ApplyPatchResult(
+                success=False,
+                dry_run=dry_run,
+                atomic=True,
+                summary=f"patch failed while writing and was rolled back: {error}",
+                changes=[],
+                errors=[str(error)],
+                would_change=would_change,
+            )
 
     return ApplyPatchResult(
         success=True,
         dry_run=dry_run,
-        summary=f"patch {'validated' if dry_run else 'applied'}: {len(changes)} file operation(s)",
+        atomic=True,
+        summary=f"patch {'validated' if dry_run else 'applied'} atomically: {len(changes)} file operation(s)",
         changes=changes,
         errors=[],
+        would_change=would_change,
     )
 
 
@@ -1098,6 +1287,7 @@ class PrepareCodingTaskTool(Tool):
             modes=modes,
             active_tools=active_tools,
             instruction_documents=instruction_documents,
+            edit_policy=_edit_policy_contract(),
             validation_hints=_compact_validation_hints(task_catalog),
             task_catalog_summary=full_task_catalog.summary(),
             task_catalog=_task_catalog_agent_view(full_task_catalog, task_catalog, include_details=False),
@@ -1137,20 +1327,22 @@ class GetCodingHarnessInstructionsTool(Tool):
                 ),
                 "code_understanding": "Inspect first with Serena search/symbol tools before editing unfamiliar code.",
                 "edits": (
-                    "Keep changes scoped. Prefer apply_patch for Codex-style textual multi-file patches, "
-                    "dry-run patch validation, and small atomic file edits; prefer semantic tools for symbol-aware edits. "
+                    "Keep changes scoped. Use semantic tools for symbol-aware edits, replace_content for exact small text edits, "
+                    "and apply_patch only for atomic multi-file or structured textual patches. "
                     "Reject ambiguous edits and do not overwrite unknown user changes."
                 ),
+                "edit_policy": _edit_policy_contract(),
                 "terminal": (
                     "Use exec_command for commands; set tty=true for interactive stdin/REPL/prompt workflows. "
-                    "Use write_stdin with terminal_session_id from exec_command.session_id for polling or interacting with running sessions."
+                    "Use write_stdin for stdin, terminal_status for non-consuming status checks, "
+                    "and send_terminal_signal for SIGINT/SIGTERM/SIGKILL instead of raw control-character hacks."
                 ),
                 "flow": "Inspect → plan when useful → edit minimally → validate focused → inspect failures → fix task-related issues → finalize.",
                 "output": "Keep command output bounded; use log_path for full logs.",
-                "sessions": "Use list_terminal_sessions and stop_terminal_session to account for or clean up background processes.",
+                "sessions": "Use list_terminal_sessions, terminal_status, send_terminal_signal, and stop_terminal_session to account for or control background processes.",
             },
             "validation": {
-                "source": "Use get_validation_commands and project scripts to choose focused checks.",
+                "source": "Use run_validation for common checks like lint, test, typecheck, format, build, or verify; use get_validation_commands/discover_project_tasks only when choosing is ambiguous.",
                 "behavior": "Run validation when practical. If blocked by missing tools or environment setup, report the blocker precisely.",
             },
             "review": {
@@ -1164,7 +1356,15 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "before_final": "Call finalize_coding_task after edits and validation attempts.",
                 "final_answer": ["what changed", "changed files", "validation results", "running sessions/services", "remaining risks"],
             },
-            "terminal_tools": ["exec_command", "write_stdin", "list_terminal_sessions", "stop_terminal_session", "execute_shell_command"],
+            "terminal_tools": [
+                "exec_command",
+                "write_stdin",
+                "terminal_status",
+                "send_terminal_signal",
+                "list_terminal_sessions",
+                "stop_terminal_session",
+                "execute_shell_command",
+            ],
             "workflow_tools": [
                 "update_plan",
                 "get_goal",
@@ -1176,6 +1376,7 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "prepare_review_task",
                 "finalize_review_task",
                 "get_validation_commands",
+                "run_validation",
                 "finalize_coding_task",
             ],
             "final_response_contract": ["what changed", "changed files", "validation", "running services", "risks"],
@@ -1339,6 +1540,66 @@ class RunTaskTool(Tool, ToolMarkerCanEdit):
             tty=task.interactive if tty is None else tty,
         )
         return _json_response(response)
+
+
+class RunValidationTool(Tool, ToolMarkerCanEdit):
+    """
+    Runs a likely validation task by kind or shortcut.
+    """
+
+    def apply(
+        self,
+        validation_id: str,
+        include_internal: bool = False,
+        yield_time_ms: int = 10000,
+        max_output_tokens: int | None = None,
+        tty: bool | None = None,
+    ) -> str:
+        """
+        Run the best matching validation task without requiring a raw command or task catalog lookup.
+
+        :param validation_id: validation kind, alias, command name, or exact task id, such as lint, test, typecheck, format, build, verify
+        :param include_internal: whether internal helper tasks may be selected
+        :param yield_time_ms: wait before yielding output
+        :param max_output_tokens: approximate output budget
+        :param tty: override whether to run through PTY; defaults to task metadata
+        :return: JSON terminal response with selected validation task metadata
+        """
+        from serena.tools.cmd_tools import TERMINAL_PROCESS_MANAGER, _json_response
+
+        active_project = self.agent.get_active_project_or_raise()
+        project_root = Path(active_project.project_root).resolve()
+        catalog = discover_task_catalog(project_root).filtered(include_internal=include_internal, max_tasks=10000)
+        task = _select_validation_task(catalog, validation_id)
+        if task is None:
+            visible_catalog = catalog.filtered(include_internal=include_internal, max_tasks=20)
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": f"No validation task matched: {validation_id}",
+                    "available_validations": [
+                        _compact_task_dict(candidate) for candidate in visible_catalog.tasks if candidate.kind in VALIDATION_KINDS
+                    ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+
+        workdir = (project_root / task.workdir).resolve()
+        if project_root not in [workdir, *workdir.parents]:
+            return json.dumps({"ok": False, "error": f"Task workdir escapes project root: {task.workdir}"}, ensure_ascii=False, indent=2)
+
+        response = TERMINAL_PROCESS_MANAGER.exec_command(
+            command=task.command,
+            cwd=workdir,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+            tty=task.interactive if tty is None else tty,
+        )
+        payload = json.loads(_json_response(response))
+        payload["validation_id"] = validation_id
+        payload["selected_task"] = _compact_task_dict(task)
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 class UpdatePlanTool(Tool):

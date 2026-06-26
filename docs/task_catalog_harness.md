@@ -61,8 +61,11 @@ Task IDs include runner information to avoid collisions, for example:
 - `discover_project_tasks(include_fixtures=true, include_examples=true)` is reserved for explicit inspection of test fixtures, samples, demos, and example projects.
 - `discover_project_tasks(include_ignored=true)` is a last-resort diagnostic option for generated, dependency, cache, or normally ignored directories.
 - `run_task(task_id)` executes a known task through the existing terminal process manager.
+- `run_validation(validation_id)` selects and runs the best matching validation task by kind or shortcut (`lint`, `test`, `typecheck`, `format`, `build`, `verify`) without requiring the agent to inspect the catalog first.
 - `get_validation_commands` stays as a backward-compatible public-only wrapper around the catalog's validation hints.
-- `prepare_coding_task` includes `task_catalog_summary` and only a small public top-task list by default.
+- `prepare_coding_task` includes `task_catalog_summary`, compact `edit_policy`, and only a small public top-task list by default.
+- Edit policy is explicit: inspect unfamiliar code first, use semantic tools for symbol-aware changes, use `replace_content` for exact small edits with `allow_multiple_occurrences=false`, and reserve `apply_patch` for atomic multi-file or structured textual patches.
+- Terminal control is structured: use `exec_command(tty=true)` for interactive commands, `write_stdin` for prompt input, `terminal_status` for non-consuming session status/output inspection, and `send_terminal_signal` for SIGINT/SIGTERM/SIGKILL.
 - Terminal `workdir` and Serena active project are separate contexts. If `exec_command` runs inside a nested Git repository or outside the active project root, the terminal response includes a warning telling the agent to call `activate_project(...)` when semantic tools should follow that repo.
 
 ## Noise control
@@ -81,6 +84,6 @@ The catalog is intentionally summary-first and root-first:
 
 V2 should add runner introspection for installed tools where safe and bounded, such as `just --list`, `task --list`, `npm run`, and `cargo metadata`.
 
-V3 should add failure classification and a structured validation runner that maps common compiler/test output into file, line, and message diagnostics.
+V3 should add failure classification that maps common compiler/test output into file, line, and message diagnostics.
 
 V4 should support learning from successful user-provided commands by writing `.serena/tasks.json` suggestions instead of hardcoding framework-specific behavior.

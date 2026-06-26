@@ -28,6 +28,18 @@ DEFAULT_MAX_OUTPUT_TOKENS = 10_000
 MAX_LIVE_TERMINAL_SESSIONS = 64
 PROTECTED_RECENT_TERMINAL_SESSIONS = 8
 INTERRUPT = "\u0003"
+TERMINAL_SIGNAL_NAMES = {
+    "INT": signal.SIGINT,
+    "SIGINT": signal.SIGINT,
+    "TERM": signal.SIGTERM,
+    "SIGTERM": signal.SIGTERM,
+    "KILL": signal.SIGKILL,
+    "SIGKILL": signal.SIGKILL,
+}
+if hasattr(signal, "SIGHUP"):
+    TERMINAL_SIGNAL_NAMES.update({"HUP": signal.SIGHUP, "SIGHUP": signal.SIGHUP})
+if hasattr(signal, "SIGQUIT"):
+    TERMINAL_SIGNAL_NAMES.update({"QUIT": signal.SIGQUIT, "SIGQUIT": signal.SIGQUIT})
 UNIFIED_EXEC_ENV = {
     "NO_COLOR": "1",
     "TERM": "dumb",
@@ -57,6 +69,20 @@ def _approx_token_count(text: str) -> int:
 
 def _chunk_id() -> str:
     return secrets.token_hex(3)
+
+
+def _resolve_terminal_signal(signal_name: str) -> tuple[str, signal.Signals]:
+    normalized = signal_name.strip().upper()
+    if not normalized:
+        raise ValueError("terminal signal must not be empty")
+
+    signum = TERMINAL_SIGNAL_NAMES.get(normalized)
+    if signum is None:
+        allowed = ", ".join(sorted(TERMINAL_SIGNAL_NAMES))
+        raise ValueError(f"Unsupported terminal signal: {signal_name}. Allowed: {allowed}")
+
+    canonical = f"SIG{normalized}" if not normalized.startswith("SIG") else normalized
+    return canonical, signum
 
 
 class HeadTailBuffer:
@@ -225,16 +251,22 @@ class TerminalSession:
             raise RuntimeError(f"Terminal session {self.session_id} stdin is closed")
         os.write(self.write_fd, chars.encode())
 
-    def interrupt(self) -> None:
+    def send_signal(self, signal_name: str) -> str:
+        canonical, signum = _resolve_terminal_signal(signal_name)
+        self.last_used = time.monotonic()
         if self.process.poll() is not None:
-            return
+            return canonical
         if os.name == "posix":
             try:
-                os.killpg(self.process.pid, signal.SIGINT)
-                return
+                os.killpg(self.process.pid, signum)
+                return canonical
             except OSError:
                 pass
-        self.process.send_signal(signal.SIGINT)
+        self.process.send_signal(signum)
+        return canonical
+
+    def interrupt(self) -> None:
+        self.send_signal("SIGINT")
 
     def collect_response(self, yield_time_ms: int, drain: bool = True) -> TerminalResponse:
         self.last_used = time.monotonic()
@@ -288,6 +320,29 @@ class TerminalSession:
             "last_used_age_ms": int((time.monotonic() - self.last_used) * 1000),
             "log_path": str(self.log_path),
         }
+
+    def status(self, include_output: bool = False, max_output_tokens: int | None = None) -> dict[str, object]:
+        self.last_used = time.monotonic()
+        self.process.poll()
+        status = self.info()
+        status["reader_done"] = self._reader_done
+        if include_output:
+            output_bytes = self._all_output.snapshot()
+            omitted = self._all_output.omitted_bytes
+            if max_output_tokens is not None:
+                buffer = HeadTailBuffer(_max_output_bytes(max_output_tokens))
+                buffer.push(output_bytes)
+                output_bytes, extra_omitted = buffer.drain()
+                omitted += extra_omitted
+            output = output_bytes.decode("utf-8", errors="replace")
+            status.update(
+                {
+                    "output": output,
+                    "original_token_count": _approx_token_count(output),
+                    "omitted_bytes": omitted,
+                }
+            )
+        return status
 
 
 class TerminalProcessManager:
@@ -463,6 +518,32 @@ class TerminalProcessManager:
             self._cleanup_exited_locked()
             sessions = sorted(self._sessions.values(), key=lambda item: item.session_id)
             return [session.info() for session in sessions if session.process.poll() is None]
+
+    def session_status(
+        self,
+        session_id: int,
+        include_output: bool = False,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, object]:
+        session = self._get(session_id)
+        status = session.status(include_output=include_output, max_output_tokens=max_output_tokens)
+        self._unregister_if_exited(session)
+        return status
+
+    def send_signal(
+        self,
+        session_id: int,
+        signal_name: str = "SIGINT",
+        yield_time_ms: int = DEFAULT_STDIN_YIELD_TIME_MS,
+        max_output_tokens: int | None = None,
+    ) -> tuple[str, TerminalResponse]:
+        session = self._get(session_id)
+        if max_output_tokens is not None:
+            session._pending_output = HeadTailBuffer(_max_output_bytes(max_output_tokens))
+        canonical = session.send_signal(signal_name)
+        response = session.collect_response(_bounded(yield_time_ms, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS))
+        self._unregister_if_exited(session)
+        return canonical, response
 
     def stop_session(self, session_id: int) -> bool:
         session = self._get(session_id)
@@ -681,6 +762,62 @@ class ListTerminalSessionsTool(Tool):
         :return: JSON list of running terminal sessions
         """
         return json.dumps({"sessions": TERMINAL_PROCESS_MANAGER.list_sessions()}, ensure_ascii=False, indent=2)
+
+
+class TerminalStatusTool(Tool):
+    """
+    Returns current status for an `exec_command` terminal session without consuming pending output.
+    """
+
+    def apply(self, terminal_session_id: int, include_output: bool = False, max_output_tokens: int | None = None) -> str:
+        """
+        Return terminal session status.
+
+        :param terminal_session_id: terminal session identifier returned as `session_id` by `exec_command`
+        :param include_output: include retained bounded output without draining pending output
+        :param max_output_tokens: approximate output budget when include_output is true
+        :return: JSON terminal status
+        """
+        return json.dumps(
+            TERMINAL_PROCESS_MANAGER.session_status(
+                terminal_session_id,
+                include_output=include_output,
+                max_output_tokens=max_output_tokens,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+class SendTerminalSignalTool(Tool, ToolMarkerCanEdit):
+    """
+    Sends a signal such as SIGINT, SIGTERM, or SIGKILL to an `exec_command` terminal session.
+    """
+
+    def apply(
+        self,
+        terminal_session_id: int,
+        signal_name: str = "SIGINT",
+        yield_time_ms: int = DEFAULT_STDIN_YIELD_TIME_MS,
+        max_output_tokens: int | None = None,
+    ) -> str:
+        """
+        Signal a running terminal session and return recent bounded output.
+
+        :param terminal_session_id: terminal session identifier returned as `session_id` by `exec_command`
+        :param signal_name: supported signal name such as SIGINT, SIGTERM, SIGKILL, SIGHUP, or SIGQUIT
+        :param yield_time_ms: wait before yielding output after the signal
+        :param max_output_tokens: approximate output budget for this response
+        :return: JSON terminal response with signal metadata
+        """
+        sent_signal, response = TERMINAL_PROCESS_MANAGER.send_signal(
+            terminal_session_id,
+            signal_name=signal_name,
+            yield_time_ms=yield_time_ms,
+            max_output_tokens=max_output_tokens,
+        )
+        payload = json.loads(_json_response(response))
+        return json.dumps({"signal": sent_signal, **payload}, ensure_ascii=False, indent=2)
 
 
 class StopTerminalSessionTool(Tool, ToolMarkerCanEdit):

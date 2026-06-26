@@ -7,9 +7,20 @@ Serena MCP should reduce ChatGPT tool-call filter issues by making common projec
 - `src/serena/tools/task_catalog.py` owns the task discovery engine.
 - `discover_project_tasks` exposes a compact catalog view as a tool: summary plus bounded `top_tasks` by default; full package files, validation hint detail, and full filtered catalog require `include_details=true`.
 - `run_task(task_id)` executes a discovered task through the existing Codex-style terminal manager.
+- `run_validation(validation_id)` is the preferred shortcut for common validation checks when task choice is obvious.
 - `get_validation_commands` remains a backward-compatible wrapper around catalog validation hints.
-- `prepare_coding_task` includes `task_catalog_summary` plus a small public top-task list, so the agent can choose safe tasks early without dumping every command.
+- `prepare_coding_task` includes `task_catalog_summary`, compact `edit_policy`, and a small public top-task list, so the agent can choose safe tasks early without dumping every command.
+- Terminal control is structured: use `exec_command(tty=true)` for interactive commands, `write_stdin` for prompt input, `terminal_status` for non-consuming session status/output inspection, and `send_terminal_signal` for SIGINT/SIGTERM/SIGKILL.
 - Terminal `workdir` is not the same as Serena active project. `exec_command`/`execute_shell_command` responses warn when a command runs in a nested Git repo or outside the active project root while semantic tools still point elsewhere.
+
+## Edit policy contract
+
+- Inspect unfamiliar code before editing.
+- Use semantic tools for symbol-aware edits: `replace_symbol_body`, `insert_before_symbol`, `insert_after_symbol`, `rename_symbol`, `safe_delete_symbol`.
+- Use `replace_content` for exact small text edits and keep `allow_multiple_occurrences=false` unless every match was inspected.
+- Use `apply_patch` for atomic multi-file or structured textual patches, not as the default small-edit tool.
+- For complex or risky patches, validate with `dry_run=true` first.
+- If `apply_patch` fails, no patch changes are written and `changes=[]`.
 
 ## Supported v1 sources
 
