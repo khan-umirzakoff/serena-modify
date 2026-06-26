@@ -67,7 +67,9 @@ Task IDs include runner information to avoid collisions, for example:
 - Edit policy is explicit: inspect unfamiliar code first, use semantic tools for symbol-aware changes, use `replace_content` for exact small edits with `allow_multiple_occurrences=false`, and reserve `apply_patch` for atomic multi-file or structured textual patches.
 - Scoped task lookup is supported through `relative_path`, so multi-repo workspaces can target `frontend`, `backend`, or a nested package without scanning/running unrelated tasks.
 - `.serena/tasks.json` v2 metadata is preserved for custom tasks: `id`, `kind`, `command`, `workdir`, `interactive`, `long_running`, `ready_pattern`, `problem_matcher`, `depends_on`, and `depends_order`.
-- Compound task metadata is catalogued, but compound execution is intentionally not automatic yet; agents should run dependency task IDs directly until a dedicated runner is implemented.
+- Compound `depends_on` tasks execute automatically when `depends_order` is `sequence`; parallel and nested compound tasks still fail closed.
+- Long-running task responses include service readiness metadata when a task defines `ready_pattern`.
+- Validation responses include compact parsed diagnostics for common `ruff` and `pytest` output.
 - Terminal control is structured: use `exec_command(tty=true)` for interactive commands, `write_stdin` for prompt input, `terminal_status` for non-consuming session status/output inspection, and `send_terminal_signal` for SIGINT/SIGTERM/SIGKILL.
 - Terminal `workdir` and Serena active project are separate contexts. If `exec_command` runs inside a nested Git repository or outside the active project root, the terminal response includes a warning telling the agent to call `activate_project(...)` when semantic tools should follow that repo.
 

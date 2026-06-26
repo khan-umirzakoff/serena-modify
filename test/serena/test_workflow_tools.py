@@ -15,12 +15,14 @@ from serena.tools.workflow_tools import (
     _infer_validation_hints,
     _load_instruction_documents,
     _normalize_validation_id,
+    _parse_validation_diagnostics,
     _resolve_focus_dir,
     _resolve_review_target,
     _save_goal_state,
     _select_focused_validation_task,
     _select_validation_task,
     _task_catalog_agent_view,
+    _task_service_status,
     _validate_goal_objective,
     _validate_plan,
     _validation_file_args,
@@ -553,6 +555,31 @@ def test_apply_patch_dry_run_multifile_does_not_write(tmp_path: Path) -> None:
     assert existing.read_text(encoding="utf-8") == "before\n"
     assert remove_me.read_text(encoding="utf-8") == "delete\n"
     assert not (tmp_path / "created.txt").exists()
+
+
+def test_validation_diagnostics_parser_extracts_ruff_and_pytest() -> None:
+    diagnostics = _parse_validation_diagnostics(
+        "src/demo.py:10:5: F401 unused import\nFAILED test/test_demo.py::test_demo - AssertionError"
+    )
+
+    assert diagnostics[0] == {"path": "src/demo.py", "line": 10, "column": 5, "message": "F401 unused import"}
+    assert diagnostics[1]["tool"] == "pytest"
+    assert diagnostics[1]["path"] == "test/test_demo.py::test_demo"
+
+
+def test_task_service_status_uses_ready_pattern() -> None:
+    class DemoTask:
+        ready_pattern = "ready"
+
+    assert _task_service_status(DemoTask(), "server ready") == {"ready_pattern": "ready", "ready": True}
+    assert _task_service_status(DemoTask(), "starting") == {"ready_pattern": "ready", "ready": False}
+
+
+def test_task_service_status_is_empty_without_pattern() -> None:
+    class DemoTask:
+        ready_pattern = None
+
+    assert _task_service_status(DemoTask(), "ready") == {}
 
 
 def test_focused_validation_command_replaces_dot_with_files(tmp_path: Path) -> None:

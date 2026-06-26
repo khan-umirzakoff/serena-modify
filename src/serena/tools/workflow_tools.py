@@ -867,6 +867,39 @@ def _select_focused_validation_task(catalog: TaskCatalog, validation_id: str, fi
     return selected, None
 
 
+def _task_service_status(task: Any, output: str) -> dict[str, Any]:
+    """Return service readiness metadata for long-running tasks."""
+    if not getattr(task, "ready_pattern", None):
+        return {}
+    return {
+        "ready_pattern": task.ready_pattern,
+        "ready": task.ready_pattern in output,
+    }
+
+
+def _parse_validation_diagnostics(output: str, max_items: int = 20) -> list[dict[str, Any]]:
+    """Parse common validation output into compact diagnostics."""
+    diagnostics: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if line.startswith("FAILED "):
+            parts = line.split(" ", 2)
+            diagnostics.append({"tool": "pytest", "path": parts[1] if len(parts) > 1 else "", "message": line})
+        else:
+            parts = line.split(":", 3)
+            if len(parts) == 4 and parts[1].isdigit() and parts[2].isdigit():
+                diagnostics.append(
+                    {
+                        "path": parts[0],
+                        "line": int(parts[1]),
+                        "column": int(parts[2]),
+                        "message": parts[3].strip(),
+                    }
+                )
+        if len(diagnostics) >= max_items:
+            break
+    return diagnostics
+
+
 def _edit_policy_contract() -> dict[str, Any]:
     """
     Return the compact edit-tool policy agents should follow.
@@ -1615,14 +1648,59 @@ class RunTaskTool(Tool, ToolMarkerCanEdit):
                 indent=2,
             )
         if task.depends_on:
+            if task.depends_order not in (None, "", "sequence"):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "Only sequence compound task execution is supported.",
+                        "task_id": task.task_id,
+                        "depends_order": task.depends_order,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            tasks_by_id = {candidate.task_id: candidate for candidate in catalog.tasks}
+            results = []
+            for dependency_id in task.depends_on:
+                dependency = tasks_by_id.get(dependency_id)
+                if dependency is None:
+                    return json.dumps(
+                        {"ok": False, "error": f"Unknown dependency task_id: {dependency_id}", "task_id": task.task_id},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                if dependency.depends_on:
+                    return json.dumps(
+                        {"ok": False, "error": "Nested compound tasks are not supported.", "task_id": dependency.task_id},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                dependency_workdir = (project_root / dependency.workdir).resolve()
+                if project_root not in [dependency_workdir, *dependency_workdir.parents]:
+                    return json.dumps(
+                        {"ok": False, "error": f"Task workdir escapes project root: {dependency.workdir}"},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                dependency_response = TERMINAL_PROCESS_MANAGER.exec_command(
+                    command=dependency.command,
+                    cwd=dependency_workdir,
+                    yield_time_ms=yield_time_ms,
+                    max_output_tokens=max_output_tokens,
+                    tty=dependency.interactive if tty is None else tty,
+                )
+                payload = json.loads(_json_response(dependency_response))
+                payload["selected_task"] = _compact_task_dict(dependency)
+                payload["service"] = _task_service_status(dependency, str(payload.get("output", "")))
+                results.append(payload)
+                if payload.get("running") or payload.get("exit_code") not in (0, None):
+                    return json.dumps(
+                        {"ok": False, "task_id": task.task_id, "depends_order": "sequence", "results": results},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
             return json.dumps(
-                {
-                    "ok": False,
-                    "error": "Compound task execution is not implemented yet; run dependency task_ids directly.",
-                    "task_id": task.task_id,
-                    "depends_on": list(task.depends_on),
-                    "depends_order": task.depends_order,
-                },
+                {"ok": True, "task_id": task.task_id, "depends_order": "sequence", "results": results},
                 ensure_ascii=False,
                 indent=2,
             )
@@ -1638,7 +1716,10 @@ class RunTaskTool(Tool, ToolMarkerCanEdit):
             max_output_tokens=max_output_tokens,
             tty=task.interactive if tty is None else tty,
         )
-        return _json_response(response)
+        payload = json.loads(_json_response(response))
+        payload["selected_task"] = _compact_task_dict(task)
+        payload["service"] = _task_service_status(task, str(payload.get("output", "")))
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 class RunValidationTool(Tool, ToolMarkerCanEdit):
@@ -1696,6 +1777,8 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
                 ensure_ascii=False,
                 indent=2,
             )
+        if file_args and focused_command is None:
+            return json.dumps({"ok": False, "error": "Focused validation unavailable"}, ensure_ascii=False, indent=2)
         if task.depends_on:
             return json.dumps(
                 {
@@ -1726,6 +1809,7 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
         payload["relative_path"] = relative_path
         payload["focused_files"] = file_args
         payload["focused_command"] = focused_command
+        payload["diagnostics"] = _parse_validation_diagnostics(str(payload.get("output", "")))
         payload["selected_task"] = _compact_task_dict(task)
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
