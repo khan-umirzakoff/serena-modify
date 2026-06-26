@@ -606,9 +606,7 @@ class TestGetRegisteredProjectWithDanglingProject:
     def _make_project_dir(self, name: str) -> Path:
         project_dir = self.test_dir / name
         (project_dir / SERENA_MANAGED_DIR_NAME).mkdir(parents=True)
-        (project_dir / SERENA_MANAGED_DIR_NAME / "project.yml").write_text(
-            f'project_name: "{name}"\nlanguages: ["python"]\n'
-        )
+        (project_dir / SERENA_MANAGED_DIR_NAME / "project.yml").write_text(f'project_name: "{name}"\nlanguages: ["python"]\n')
         return project_dir
 
     def test_dangling_project_does_not_break_lookup_of_valid_project(self):
