@@ -608,10 +608,12 @@ class ProjectConfig(SharedConfig, ModeSelectionDefinitionWithAddedModes):
         # instantiate the ProjectConfig
         project_config = cls._from_dict(yaml_data, local_override_keys=local_override_keys)
 
-        # if the configuration was incomplete, re-save it to disk
+        # If the configuration was incomplete, keep the defaulted values in memory
+        # without rewriting the user's project.yml during ordinary load/activate.
+        # Persisting defaults belongs to an explicit save/normalise action; doing it
+        # here creates noisy git diffs for tracked compact project configs.
         if not was_complete:
-            log.info("Project configuration in %s was incomplete, re-saving with default values for missing fields", yaml_path)
-            project_config.save(str(yaml_path), save_project_local_yml=False)
+            log.info("Project configuration in %s was incomplete; using default values for missing fields in memory", yaml_path)
 
         return project_config
 

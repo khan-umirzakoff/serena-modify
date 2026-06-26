@@ -144,6 +144,25 @@ class TestProjectConfig:
         _, is_complete = ProjectConfig._load_yaml_dict(PROJECT_TEMPLATE_FILE)
         assert is_complete, "Project template YAML is incomplete; all fields must be present (with descriptions)."
 
+    def test_load_incomplete_project_config_does_not_rewrite_file(self):
+        project_root = Path(tempfile.mkdtemp())
+        try:
+            serena_config = create_default_serena_config()
+            serena_dir = project_root / SERENA_MANAGED_DIR_NAME
+            serena_dir.mkdir()
+            project_yml = serena_dir / "project.yml"
+            original_content = 'project_name: "compact"\nlanguages:\n  - python\n'
+            project_yml.write_text(original_content, encoding="utf-8")
+
+            config = ProjectConfig.load(project_root, serena_config=serena_config)
+
+            assert config.project_name == "compact"
+            assert config.languages == [Language.PYTHON]
+            assert config.encoding
+            assert project_yml.read_text(encoding="utf-8") == original_content
+        finally:
+            shutil.rmtree(project_root, ignore_errors=True)
+
 
 class TestProjectConfigLanguageBackend:
     """Tests for the per-project language_backend field."""
