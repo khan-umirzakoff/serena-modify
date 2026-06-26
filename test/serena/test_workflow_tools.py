@@ -151,6 +151,61 @@ def test_task_catalog_filtered_view_hides_internal_tasks_and_prefers_root_tasks(
     assert any("test/resources" in package_file for package_file in catalog_with_fixtures.package_files)
 
 
+def test_discover_task_catalog_can_be_scoped_to_relative_path(tmp_path: Path) -> None:
+    frontend = tmp_path / "apps" / "frontend"
+    backend = tmp_path / "apps" / "backend"
+    frontend.mkdir(parents=True)
+    backend.mkdir(parents=True)
+    (frontend / "package.json").write_text('{"scripts": {"lint": "eslint ."}}', encoding="utf-8")
+    (backend / "package.json").write_text('{"scripts": {"test": "vitest"}}', encoding="utf-8")
+
+    catalog = discover_task_catalog(tmp_path, relative_path="apps/frontend")
+
+    assert [task.workdir for task in catalog.tasks] == ["apps/frontend"]
+    assert [task.task_id for task in catalog.tasks] == ["apps:frontend:npm:lint:lint"]
+    assert catalog.package_files == ["apps/frontend/package.json"]
+
+
+def test_task_override_v2_metadata_is_preserved(tmp_path: Path) -> None:
+    (tmp_path / ".serena").mkdir()
+    (tmp_path / ".serena" / "tasks.json").write_text(
+        """
+{
+  "version": 2,
+  "tasks": [
+    {
+      "id": "frontend:dev",
+      "kind": "dev",
+      "command": "npm run dev",
+      "workdir": "apps/frontend",
+      "long_running": true,
+      "ready_pattern": "ready",
+      "problem_matcher": "vite"
+    },
+    {
+      "id": "verify",
+      "kind": "verify",
+      "depends_on": ["frontend:lint", "backend:test"],
+      "depends_order": "sequence"
+    }
+  ]
+}
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "apps" / "frontend").mkdir(parents=True)
+
+    catalog = discover_task_catalog(tmp_path)
+    tasks = {task.task_id: task for task in catalog.tasks}
+
+    assert tasks["frontend:dev"].ready_pattern == "ready"
+    assert tasks["frontend:dev"].problem_matcher == "vite"
+    assert tasks["frontend:dev"].long_running is True
+    assert tasks["verify"].runner == "compound"
+    assert tasks["verify"].depends_on == ("frontend:lint", "backend:test")
+    assert tasks["verify"].depends_order == "sequence"
+
+
 def test_task_catalog_agent_view_is_compact_by_default(tmp_path: Path) -> None:
     (tmp_path / "package.json").write_text(
         '{"scripts": {"lint": "eslint .", "test": "vitest", "build": "vite build"}}',

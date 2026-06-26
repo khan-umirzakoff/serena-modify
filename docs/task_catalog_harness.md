@@ -56,15 +56,18 @@ Task IDs include runner information to avoid collisions, for example:
 
 ## Tool flow
 
-- `discover_project_tasks(include_internal=false, include_fixtures=false, include_examples=false, include_ignored=false, max_tasks=30, include_details=false)` returns only summary plus bounded `top_tasks` by default; full package files and validation hint detail are opt-in.
+- `discover_project_tasks(include_internal=false, include_fixtures=false, include_examples=false, include_ignored=false, max_tasks=30, include_details=false, relative_path=".")` returns only summary plus bounded `top_tasks` by default; full package files and validation hint detail are opt-in.
 - `discover_project_tasks(include_internal=true)` is reserved for debugging or advanced agent use when helper tasks are needed.
 - `discover_project_tasks(include_fixtures=true, include_examples=true)` is reserved for explicit inspection of test fixtures, samples, demos, and example projects.
 - `discover_project_tasks(include_ignored=true)` is a last-resort diagnostic option for generated, dependency, cache, or normally ignored directories.
-- `run_task(task_id)` executes a known task through the existing terminal process manager.
-- `run_validation(validation_id)` selects and runs the best matching validation task by kind or shortcut (`lint`, `test`, `typecheck`, `format`, `build`, `verify`) without requiring the agent to inspect the catalog first.
-- `get_validation_commands` stays as a backward-compatible public-only wrapper around the catalog's validation hints.
+- `run_task(task_id, relative_path=".")` executes a known task through the existing terminal process manager after scoped lookup.
+- `run_validation(validation_id, relative_path=".")` selects and runs the best matching validation task by kind or shortcut (`lint`, `test`, `typecheck`, `format`, `build`, `verify`) without requiring the agent to inspect the catalog first.
+- `get_validation_commands(relative_path=".")` stays as a backward-compatible public-only wrapper around the catalog's validation hints.
 - `prepare_coding_task` includes `task_catalog_summary`, compact `edit_policy`, and only a small public top-task list by default.
 - Edit policy is explicit: inspect unfamiliar code first, use semantic tools for symbol-aware changes, use `replace_content` for exact small edits with `allow_multiple_occurrences=false`, and reserve `apply_patch` for atomic multi-file or structured textual patches.
+- Scoped task lookup is supported through `relative_path`, so multi-repo workspaces can target `frontend`, `backend`, or a nested package without scanning/running unrelated tasks.
+- `.serena/tasks.json` v2 metadata is preserved for custom tasks: `id`, `kind`, `command`, `workdir`, `interactive`, `long_running`, `ready_pattern`, `problem_matcher`, `depends_on`, and `depends_order`.
+- Compound task metadata is catalogued, but compound execution is intentionally not automatic yet; agents should run dependency task IDs directly until a dedicated runner is implemented.
 - Terminal control is structured: use `exec_command(tty=true)` for interactive commands, `write_stdin` for prompt input, `terminal_status` for non-consuming session status/output inspection, and `send_terminal_signal` for SIGINT/SIGTERM/SIGKILL.
 - Terminal `workdir` and Serena active project are separate contexts. If `exec_command` runs inside a nested Git repository or outside the active project root, the terminal response includes a warning telling the agent to call `activate_project(...)` when semantic tools should follow that repo.
 

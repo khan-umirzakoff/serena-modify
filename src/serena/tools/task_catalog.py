@@ -101,6 +101,10 @@ class ProjectTask:
     long_running: bool = False
     visibility: str = "public"
     priority: int = 100
+    depends_on: tuple[str, ...] = ()
+    depends_order: str | None = None
+    ready_pattern: str | None = None
+    problem_matcher: str | None = None
 
 
 @dataclass(frozen=True)
@@ -157,12 +161,55 @@ class TaskCatalog:
         }
 
 
+def _resolve_catalog_scope(project_root: Path, relative_path: str | Path = ".") -> Path:
+    """Project-local directory used to scope task discovery."""
+    raw_path = Path(relative_path)
+    if raw_path.is_absolute():
+        raise ValueError(f"Task catalog scope must be project-relative: {relative_path}")
+
+    candidate = (project_root / raw_path).resolve()
+    if candidate != project_root and project_root not in candidate.parents:
+        raise ValueError(f"Task catalog scope escapes project root: {relative_path}")
+    if candidate.is_file():
+        candidate = candidate.parent
+    if not candidate.exists():
+        raise FileNotFoundError(f"Task catalog scope does not exist: {relative_path}")
+    if not candidate.is_dir():
+        raise NotADirectoryError(f"Task catalog scope is not a directory: {relative_path}")
+    return candidate
+
+
+def _path_in_scope(path: Path, scope_root: Path) -> bool:
+    """Whether a path is inside the scoped catalog root."""
+    resolved_path = path.resolve()
+    resolved_scope = scope_root.resolve()
+    return resolved_path == resolved_scope or resolved_scope in resolved_path.parents
+
+
+def _task_in_scope(project_root: Path, task: ProjectTask, scope_root: Path) -> bool:
+    """Whether a task workdir belongs to the scoped catalog root."""
+    return _path_in_scope(project_root / task.workdir, scope_root)
+
+
+def _tuple_of_strings(value: Any) -> tuple[str, ...]:
+    """String tuple parsed from a JSON scalar or list."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        stripped = value.strip()
+        return (stripped,) if stripped else ()
+    if isinstance(value, list):
+        return tuple(str(item).strip() for item in value if str(item).strip())
+    return ()
+
+
 def discover_task_catalog(
     project_root: Path,
     max_depth: int = 5,
     include_fixtures: bool = False,
     include_examples: bool = False,
     include_ignored: bool = False,
+    relative_path: str | Path = ".",
 ) -> TaskCatalog:
     """
     Discover runnable project tasks from manifests and overrides.
@@ -172,16 +219,22 @@ def discover_task_catalog(
     :param include_fixtures: whether fixture and test-resource manifests should be scanned
     :param include_examples: whether example, sample, and demo manifests should be scanned
     :param include_ignored: whether generated/dependency/cache directories should be scanned
+    :param relative_path: project-relative file or directory used to scope task discovery
     :return: discovered task catalog
     """
     project_root = project_root.resolve()
+    scope_root = _resolve_catalog_scope(project_root, relative_path)
     package_files: list[str] = []
     managers: list[str] = []
     tasks: list[ProjectTask] = []
 
     for override_path in _task_override_files(project_root):
-        _append_unique(package_files, _relative_path(override_path, project_root))
-        tasks.extend(_tasks_from_override(project_root, override_path, managers))
+        override_tasks = _tasks_from_override(project_root, override_path, managers)
+        if scope_root != project_root:
+            override_tasks = [task for task in override_tasks if _task_in_scope(project_root, task, scope_root)]
+        if override_tasks:
+            _append_unique(package_files, _relative_path(override_path, project_root))
+            tasks.extend(override_tasks)
 
     manifests = _iter_manifest_files(
         project_root,
@@ -189,6 +242,7 @@ def discover_task_catalog(
         include_fixtures=include_fixtures,
         include_examples=include_examples,
         include_ignored=include_ignored,
+        scan_root=scope_root,
     )
     for manifest in manifests:
         _append_unique(package_files, _relative_path(manifest, project_root))
@@ -198,21 +252,34 @@ def discover_task_catalog(
     hints = ValidationHints(
         package_files=package_files,
         detected_package_managers=managers,
-        likely_commands=[task.command for task in tasks if task.kind in VALIDATION_KINDS],
+        likely_commands=[task.command for task in tasks if task.command and task.kind in VALIDATION_KINDS],
     )
     return TaskCatalog(package_files=package_files, detected_package_managers=managers, tasks=tasks, validation_hints=hints)
 
 
-def infer_validation_hints(project_root: Path, include_internal: bool = False, max_tasks: int = 30) -> ValidationHints:
+def infer_validation_hints(
+    project_root: Path,
+    include_internal: bool = False,
+    max_tasks: int = 30,
+    relative_path: str | Path = ".",
+) -> ValidationHints:
     """
     Infer validation hints from the universal task catalog.
 
     :param project_root: project root directory
     :param include_internal: whether internal helper tasks should be included
     :param max_tasks: maximum number of tasks to consider
+    :param relative_path: project-relative file or directory used to scope task discovery
     :return: likely validation commands and sources
     """
-    return discover_task_catalog(project_root).filtered(include_internal=include_internal, max_tasks=max_tasks).validation_hints
+    return (
+        discover_task_catalog(project_root, relative_path=relative_path)
+        .filtered(
+            include_internal=include_internal,
+            max_tasks=max_tasks,
+        )
+        .validation_hints
+    )
 
 
 def _task_override_files(project_root: Path) -> list[Path]:
@@ -226,14 +293,16 @@ def _iter_manifest_files(
     include_fixtures: bool,
     include_examples: bool,
     include_ignored: bool,
+    scan_root: Path | None = None,
 ) -> list[Path]:
     """Manifest files discovered by bounded directory traversal."""
     manifests: list[Path] = []
-    frontier = [project_root]
+    root = (scan_root or project_root).resolve()
+    frontier = [root]
 
     while frontier:
         directory = frontier.pop(0)
-        depth = len(directory.relative_to(project_root).parts)
+        depth = len(directory.relative_to(root).parts)
         if depth > max_depth:
             continue
         try:
@@ -636,21 +705,31 @@ def _tasks_from_override(project_root: Path, override_path: Path, managers: list
             continue
         task_id = str(raw_task.get("task_id") or raw_task.get("id") or "").strip()
         command = str(raw_task.get("command") or "").strip()
-        if not task_id or not command:
+        depends_on = _tuple_of_strings(raw_task.get("depends_on") or raw_task.get("dependsOn"))
+        if not task_id or (not command and not depends_on):
             continue
-        runner = str(raw_task.get("runner") or "custom")
+        runner = str(raw_task.get("runner") or ("compound" if depends_on else "custom"))
         _append_unique(managers, runner)
+        kind = str(raw_task.get("kind") or _classify_task_name(task_id))
+        visibility = str(raw_task.get("visibility") or _task_visibility(task_id))
+        priority = int(raw_task.get("priority") or _task_priority(kind, task_id))
         tasks.append(
             ProjectTask(
                 task_id=task_id,
-                kind=str(raw_task.get("kind") or _classify_task_name(task_id)),
+                kind=kind,
                 runner=runner,
                 command=command,
                 workdir=str(raw_task.get("workdir") or "."),
                 source=_relative_path(override_path, project_root),
                 confidence=str(raw_task.get("confidence") or "override"),
                 interactive=bool(raw_task.get("interactive", False)),
-                long_running=bool(raw_task.get("long_running", False)),
+                long_running=bool(raw_task.get("long_running", raw_task.get("longRunning", False))),
+                visibility=visibility,
+                priority=priority,
+                depends_on=depends_on,
+                depends_order=str(raw_task.get("depends_order") or raw_task.get("dependsOrder") or "") or None,
+                ready_pattern=str(raw_task.get("ready_pattern") or raw_task.get("readyPattern") or "") or None,
+                problem_matcher=str(raw_task.get("problem_matcher") or raw_task.get("problemMatcher") or "") or None,
             )
         )
     return tasks

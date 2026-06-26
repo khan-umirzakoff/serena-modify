@@ -1,22 +1,26 @@
 {
-  "updated_at": "2026-06-26T20:34:30.560532Z",
-  "explanation": "Phase 3 terminal status/signal control implemented and focused validation passed.",
+  "updated_at": "2026-06-26T21:31:54.442458Z",
+  "explanation": "Phase 4 scoped discovery/runtime support and v2 override metadata are implemented; docs/memory updates remain.",
   "plan": [
     {
-      "step": "Inspect terminal session gaps",
+      "step": "Inspect current task catalog schema and tool flow",
       "status": "completed"
     },
     {
-      "step": "Add status and signal terminal APIs",
+      "step": "Design minimal Task Catalog v2 contract",
       "status": "completed"
     },
     {
-      "step": "Expose tools and update tests/docs",
+      "step": "Implement scoped manifest/task execution support",
       "status": "completed"
+    },
+    {
+      "step": "Add tests and docs",
+      "status": "in_progress"
     },
     {
       "step": "Run focused validation",
-      "status": "completed"
+      "status": "pending"
     }
   ],
   "state_path": "/home/khan/PROJECTS/Serena_MCP_mutation/serena/.serena/plan_state.json"

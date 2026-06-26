@@ -1276,7 +1276,7 @@ class PrepareCodingTaskTool(Tool):
         )
 
         context, modes, active_tools = _active_serena_state(self.agent)
-        full_task_catalog = discover_task_catalog(project_root)
+        full_task_catalog = discover_task_catalog(project_root, relative_path=relative_path)
         task_catalog = full_task_catalog.filtered(include_internal=False, max_tasks=15)
 
         snapshot = CodingTaskSnapshot(
@@ -1419,17 +1419,21 @@ class GetValidationCommandsTool(Tool):
     Returns inferred project validation commands.
     """
 
-    def apply(self, include_internal: bool = False, max_tasks: int = 30) -> str:
+    def apply(self, include_internal: bool = False, max_tasks: int = 30, relative_path: str = ".") -> str:
         """
         Return likely validation commands for the active project.
 
         :param include_internal: whether internal helper tasks should be included
         :param max_tasks: maximum number of validation tasks to consider
+        :param relative_path: project-relative file or directory used to scope task discovery
         :return: JSON validation command hints
         """
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
-        catalog = discover_task_catalog(project_root).filtered(include_internal=include_internal, max_tasks=max_tasks)
+        catalog = discover_task_catalog(project_root, relative_path=relative_path).filtered(
+            include_internal=include_internal,
+            max_tasks=max_tasks,
+        )
         return json.dumps(asdict(catalog.validation_hints), ensure_ascii=False, indent=2)
 
 
@@ -1447,6 +1451,7 @@ class DiscoverProjectTasksTool(Tool):
         include_ignored: bool = False,
         max_tasks: int = 30,
         include_details: bool = False,
+        relative_path: str = ".",
     ) -> str:
         """
         Return the universal project task catalog.
@@ -1458,6 +1463,7 @@ class DiscoverProjectTasksTool(Tool):
         :param include_ignored: whether generated/dependency/cache directories should be scanned
         :param max_tasks: maximum number of tasks to include in the task list; set to 0 for none
         :param include_details: whether full package files and validation hints should be returned
+        :param relative_path: project-relative file or directory used to scope task discovery
         :return: JSON project task catalog
         """
         active_project = self.agent.get_active_project_or_raise()
@@ -1468,6 +1474,7 @@ class DiscoverProjectTasksTool(Tool):
             include_fixtures=include_fixtures,
             include_examples=include_examples,
             include_ignored=include_ignored,
+            relative_path=relative_path,
         )
         visible_catalog = catalog.filtered(include_internal=include_internal, max_tasks=max_tasks)
         response = _task_catalog_agent_view(
@@ -1482,6 +1489,7 @@ class DiscoverProjectTasksTool(Tool):
             "include_ignored": include_ignored,
             "max_tasks": max_tasks,
             "include_details": include_details,
+            "relative_path": relative_path,
         }
         return json.dumps(response, ensure_ascii=False, indent=2)
 
@@ -1494,6 +1502,7 @@ class RunTaskTool(Tool, ToolMarkerCanEdit):
     def apply(
         self,
         task_id: str,
+        relative_path: str = ".",
         yield_time_ms: int = 10000,
         max_output_tokens: int | None = None,
         tty: bool | None = None,
@@ -1502,6 +1511,7 @@ class RunTaskTool(Tool, ToolMarkerCanEdit):
         Run a task from the discovered task catalog.
 
         :param task_id: task identifier returned by discover_project_tasks
+        :param relative_path: project-relative file or directory used to scope task lookup
         :param yield_time_ms: wait before yielding output
         :param max_output_tokens: approximate output budget
         :param tty: override whether to run through PTY; defaults to task metadata
@@ -1511,10 +1521,15 @@ class RunTaskTool(Tool, ToolMarkerCanEdit):
 
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
-        catalog = discover_task_catalog(project_root)
+        catalog = discover_task_catalog(project_root, relative_path=relative_path)
         task = next((candidate for candidate in catalog.tasks if candidate.task_id == task_id), None)
         if task is None:
-            catalog = discover_task_catalog(project_root, include_fixtures=True, include_examples=True)
+            catalog = discover_task_catalog(
+                project_root,
+                include_fixtures=True,
+                include_examples=True,
+                relative_path=relative_path,
+            )
             task = next((candidate for candidate in catalog.tasks if candidate.task_id == task_id), None)
         if task is None:
             visible_catalog = catalog.filtered(include_internal=False, max_tasks=30)
@@ -1522,7 +1537,20 @@ class RunTaskTool(Tool, ToolMarkerCanEdit):
                 {
                     "ok": False,
                     "error": f"Unknown task_id: {task_id}",
+                    "relative_path": relative_path,
                     "available_task_ids": [candidate.task_id for candidate in visible_catalog.tasks],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        if task.depends_on:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "Compound task execution is not implemented yet; run dependency task_ids directly.",
+                    "task_id": task.task_id,
+                    "depends_on": list(task.depends_on),
+                    "depends_order": task.depends_order,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1550,6 +1578,7 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
     def apply(
         self,
         validation_id: str,
+        relative_path: str = ".",
         include_internal: bool = False,
         yield_time_ms: int = 10000,
         max_output_tokens: int | None = None,
@@ -1559,6 +1588,7 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
         Run the best matching validation task without requiring a raw command or task catalog lookup.
 
         :param validation_id: validation kind, alias, command name, or exact task id, such as lint, test, typecheck, format, build, verify
+        :param relative_path: project-relative file or directory used to scope validation lookup
         :param include_internal: whether internal helper tasks may be selected
         :param yield_time_ms: wait before yielding output
         :param max_output_tokens: approximate output budget
@@ -1569,7 +1599,10 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
 
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
-        catalog = discover_task_catalog(project_root).filtered(include_internal=include_internal, max_tasks=10000)
+        catalog = discover_task_catalog(project_root, relative_path=relative_path).filtered(
+            include_internal=include_internal,
+            max_tasks=10000,
+        )
         task = _select_validation_task(catalog, validation_id)
         if task is None:
             visible_catalog = catalog.filtered(include_internal=include_internal, max_tasks=20)
@@ -1577,9 +1610,23 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
                 {
                     "ok": False,
                     "error": f"No validation task matched: {validation_id}",
+                    "relative_path": relative_path,
                     "available_validations": [
                         _compact_task_dict(candidate) for candidate in visible_catalog.tasks if candidate.kind in VALIDATION_KINDS
                     ],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        if task.depends_on:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "Compound validation tasks are not implemented yet; run dependency task_ids directly.",
+                    "validation_id": validation_id,
+                    "task_id": task.task_id,
+                    "depends_on": list(task.depends_on),
+                    "depends_order": task.depends_order,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1598,6 +1645,7 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
         )
         payload = json.loads(_json_response(response))
         payload["validation_id"] = validation_id
+        payload["relative_path"] = relative_path
         payload["selected_task"] = _compact_task_dict(task)
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
