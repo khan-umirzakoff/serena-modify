@@ -7,6 +7,7 @@ from serena.tools.workflow_tools import (
     _apply_codex_style_patch,
     _compact_validation_hints,
     _edit_policy_contract,
+    _focused_validation_command,
     _format_plan_markdown,
     _goal_public_state,
     _goal_response,
@@ -17,10 +18,12 @@ from serena.tools.workflow_tools import (
     _resolve_focus_dir,
     _resolve_review_target,
     _save_goal_state,
+    _select_focused_validation_task,
     _select_validation_task,
     _task_catalog_agent_view,
     _validate_goal_objective,
     _validate_plan,
+    _validation_file_args,
 )
 
 
@@ -550,6 +553,47 @@ def test_apply_patch_dry_run_multifile_does_not_write(tmp_path: Path) -> None:
     assert existing.read_text(encoding="utf-8") == "before\n"
     assert remove_me.read_text(encoding="utf-8") == "delete\n"
     assert not (tmp_path / "created.txt").exists()
+
+
+def test_focused_validation_command_replaces_dot_with_files(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[tool.ruff]\n", encoding="utf-8")
+
+    catalog = discover_task_catalog(tmp_path).filtered(include_internal=False, max_tasks=10000)
+    task = _select_validation_task(catalog, "lint")
+
+    assert task is not None
+    assert _focused_validation_command(task, ["src/example.py"]) == "python -m ruff check src/example.py"
+
+
+def test_select_focused_validation_prefers_focusable_task(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "[tool.poe.tasks]\nlint = 'ruff check .'\n[tool.ruff]\n",
+        encoding="utf-8",
+    )
+
+    catalog = discover_task_catalog(tmp_path).filtered(include_internal=False, max_tasks=10000)
+    task, command = _select_focused_validation_task(catalog, "lint", ["src/example.py"])
+
+    assert task is not None
+    assert command == "python -m ruff check src/example.py"
+
+
+def test_validation_file_args_rejects_files_outside_scope(tmp_path: Path) -> None:
+    scope = tmp_path / "apps" / "frontend"
+    outside = tmp_path / "apps" / "backend"
+    scope.mkdir(parents=True)
+    outside.mkdir(parents=True)
+    (scope / "page.py").write_text("", encoding="utf-8")
+    (outside / "api.py").write_text("", encoding="utf-8")
+
+    assert _validation_file_args(tmp_path, "apps/frontend", ["apps/frontend/page.py"]) == ["apps/frontend/page.py"]
+
+    try:
+        _validation_file_args(tmp_path, "apps/frontend", ["apps/backend/api.py"])
+    except ValueError as error:
+        assert "outside relative_path scope" in str(error)
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_select_validation_task_accepts_shortcuts(tmp_path: Path) -> None:

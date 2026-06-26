@@ -4,6 +4,7 @@ Tools supporting the general workflow of the agent
 
 import json
 import platform
+import shlex
 import subprocess
 import tomllib
 from dataclasses import asdict, dataclass
@@ -796,6 +797,76 @@ def _select_validation_task(catalog: TaskCatalog, validation_id: str) -> Any | N
     return None
 
 
+def _validation_file_args(project_root: Path, relative_path: str, files: list[str] | None) -> list[str]:
+    """Validate project-relative focused validation file arguments."""
+    if not files:
+        return []
+    scope_root = (project_root / relative_path).resolve()
+    if scope_root.is_file():
+        scope_root = scope_root.parent
+    if scope_root != project_root and project_root not in scope_root.parents:
+        raise ValueError(f"Validation scope escapes project root: {relative_path}")
+
+    result: list[str] = []
+    for file_path in files:
+        raw_path = Path(file_path)
+        if raw_path.is_absolute():
+            raise ValueError(f"Focused validation files must be project-relative: {file_path}")
+        resolved = (project_root / raw_path).resolve()
+        if resolved != project_root and project_root not in resolved.parents:
+            raise ValueError(f"Focused validation file escapes project root: {file_path}")
+        if scope_root != project_root and resolved != scope_root and scope_root not in resolved.parents:
+            raise ValueError(f"Focused validation file is outside relative_path scope: {file_path}")
+        result.append(resolved.relative_to(project_root).as_posix())
+    return result
+
+
+def _replace_dot_arg(parts: list[str], file_args: list[str]) -> list[str]:
+    """Replace the final dot argument with focused file args when present."""
+    if parts and parts[-1] == ".":
+        return [*parts[:-1], *file_args]
+    return [*parts, *file_args]
+
+
+def _focused_validation_command(task: Any, file_args: list[str]) -> str | None:
+    """Return a focused validation command for safe, known runners."""
+    if not file_args:
+        return None
+
+    parts = shlex.split(task.command)
+    if not parts:
+        return None
+
+    joined = " ".join(parts)
+    if "ruff check" in joined:
+        return " ".join(shlex.quote(part) for part in _replace_dot_arg(parts, file_args))
+    if "ruff format" in joined:
+        return " ".join(shlex.quote(part) for part in _replace_dot_arg(parts, file_args))
+    if "pytest" in parts:
+        return " ".join(shlex.quote(part) for part in _replace_dot_arg(parts, file_args))
+
+    return None
+
+
+def _select_focused_validation_task(catalog: TaskCatalog, validation_id: str, file_args: list[str]) -> tuple[Any | None, str | None]:
+    """Select a validation task, preferring focus-capable commands when files are provided."""
+    selected = _select_validation_task(catalog, validation_id)
+    if not file_args:
+        return selected, None
+
+    normalized = _normalize_validation_id(validation_id)
+    candidates = [task for task in catalog.tasks if task.kind == normalized or task.task_id == validation_id]
+    if selected is not None and selected not in candidates:
+        candidates.append(selected)
+
+    for candidate in candidates:
+        command = _focused_validation_command(candidate, file_args)
+        if command is not None:
+            return candidate, command
+
+    return selected, None
+
+
 def _edit_policy_contract() -> dict[str, Any]:
     """
     Return the compact edit-tool policy agents should follow.
@@ -1579,6 +1650,7 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
         self,
         validation_id: str,
         relative_path: str = ".",
+        files: list[str] | None = None,
         include_internal: bool = False,
         yield_time_ms: int = 10000,
         max_output_tokens: int | None = None,
@@ -1589,6 +1661,7 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
 
         :param validation_id: validation kind, alias, command name, or exact task id, such as lint, test, typecheck, format, build, verify
         :param relative_path: project-relative file or directory used to scope validation lookup
+        :param files: optional project-relative files or test paths for focused validation
         :param include_internal: whether internal helper tasks may be selected
         :param yield_time_ms: wait before yielding output
         :param max_output_tokens: approximate output budget
@@ -1599,11 +1672,16 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
 
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
+        try:
+            file_args = _validation_file_args(project_root, relative_path, files)
+        except Exception as error:
+            return json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False, indent=2)
+
         catalog = discover_task_catalog(project_root, relative_path=relative_path).filtered(
             include_internal=include_internal,
             max_tasks=10000,
         )
-        task = _select_validation_task(catalog, validation_id)
+        task, focused_command = _select_focused_validation_task(catalog, validation_id, file_args)
         if task is None:
             visible_catalog = catalog.filtered(include_internal=include_internal, max_tasks=20)
             return json.dumps(
@@ -1637,7 +1715,7 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
             return json.dumps({"ok": False, "error": f"Task workdir escapes project root: {task.workdir}"}, ensure_ascii=False, indent=2)
 
         response = TERMINAL_PROCESS_MANAGER.exec_command(
-            command=task.command,
+            command=focused_command or task.command,
             cwd=workdir,
             yield_time_ms=yield_time_ms,
             max_output_tokens=max_output_tokens,
@@ -1646,6 +1724,8 @@ class RunValidationTool(Tool, ToolMarkerCanEdit):
         payload = json.loads(_json_response(response))
         payload["validation_id"] = validation_id
         payload["relative_path"] = relative_path
+        payload["focused_files"] = file_args
+        payload["focused_command"] = focused_command
         payload["selected_task"] = _compact_task_dict(task)
         return json.dumps(payload, ensure_ascii=False, indent=2)
 

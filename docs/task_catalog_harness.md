@@ -61,7 +61,7 @@ Task IDs include runner information to avoid collisions, for example:
 - `discover_project_tasks(include_fixtures=true, include_examples=true)` is reserved for explicit inspection of test fixtures, samples, demos, and example projects.
 - `discover_project_tasks(include_ignored=true)` is a last-resort diagnostic option for generated, dependency, cache, or normally ignored directories.
 - `run_task(task_id, relative_path=".")` executes a known task through the existing terminal process manager after scoped lookup.
-- `run_validation(validation_id, relative_path=".")` selects and runs the best matching validation task by kind or shortcut (`lint`, `test`, `typecheck`, `format`, `build`, `verify`) without requiring the agent to inspect the catalog first.
+- `run_validation(validation_id, relative_path=".", files=[...])` selects and runs validation; `files` narrows safe known runners such as `ruff check`, `ruff format`, and `pytest`.
 - `get_validation_commands(relative_path=".")` stays as a backward-compatible public-only wrapper around the catalog's validation hints.
 - `prepare_coding_task` includes `task_catalog_summary`, compact `edit_policy`, and only a small public top-task list by default.
 - Edit policy is explicit: inspect unfamiliar code first, use semantic tools for symbol-aware changes, use `replace_content` for exact small edits with `allow_multiple_occurrences=false`, and reserve `apply_patch` for atomic multi-file or structured textual patches.
