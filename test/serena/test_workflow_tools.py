@@ -13,6 +13,7 @@ from serena.tools.workflow_tools import (
     _goal_response,
     _goal_state_path,
     _infer_validation_hints,
+    _load_coding_task_context,
     _load_instruction_documents,
     _normalize_validation_id,
     _parse_validation_diagnostics,
@@ -20,6 +21,7 @@ from serena.tools.workflow_tools import (
     _resolve_git_root,
     _resolve_review_target,
     _run_git_snapshot,
+    _save_coding_task_context,
     _save_goal_state,
     _select_focused_validation_task,
     _select_validation_task,
@@ -557,6 +559,14 @@ def test_apply_patch_dry_run_multifile_does_not_write(tmp_path: Path) -> None:
     assert existing.read_text(encoding="utf-8") == "before\n"
     assert remove_me.read_text(encoding="utf-8") == "delete\n"
     assert not (tmp_path / "created.txt").exists()
+
+
+def test_coding_task_context_round_trips_latest_focus(tmp_path: Path) -> None:
+    state = {"focus_path": "crm-frontend", "git_root": str(tmp_path / "crm-frontend")}
+
+    _save_coding_task_context(tmp_path, state)
+
+    assert _load_coding_task_context(tmp_path) == state
 
 
 def test_resolve_git_root_prefers_nested_repo(tmp_path: Path) -> None:

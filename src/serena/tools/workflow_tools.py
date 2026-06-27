@@ -60,6 +60,7 @@ class CodingTaskSnapshot:
 
 GOAL_STATE_FILENAME = "goal_state.json"
 PLAN_STATE_FILENAME = "plan_state.json"
+CODING_TASK_CONTEXT_FILENAME = "coding_task_context.json"
 MAX_GOAL_OBJECTIVE_CHARS = 4000
 MODEL_SETTABLE_GOAL_STATUSES = {"complete", "blocked"}
 PLAN_STATUSES = {"pending", "in_progress", "completed"}
@@ -87,6 +88,27 @@ def _goal_state_path(project_root: Path) -> Path:
 
 def _plan_state_path(project_root: Path) -> Path:
     return _serena_state_path(project_root, PLAN_STATE_FILENAME)
+
+
+def _coding_task_context_path(project_root: Path) -> Path:
+    return _serena_state_path(project_root, CODING_TASK_CONTEXT_FILENAME)
+
+
+def _save_coding_task_context(project_root: Path, state: dict[str, Any]) -> None:
+    path = _coding_task_context_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _load_coding_task_context(project_root: Path) -> dict[str, Any] | None:
+    path = _coding_task_context_path(project_root)
+    if not path.is_file():
+        return None
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return state if isinstance(state, dict) else None
 
 
 def _validate_goal_objective(objective: str) -> None:
@@ -1411,6 +1433,15 @@ class PrepareCodingTaskTool(Tool):
         task_catalog = full_task_catalog.filtered(include_internal=False, max_tasks=15)
 
         git_root = _resolve_git_root(project_root, focus_dir)
+        _save_coding_task_context(
+            project_root,
+            {
+                "relative_path": relative_path,
+                "focus_path": focus_path,
+                "git_root": str(git_root),
+                "updated_at": _utc_now(),
+            },
+        )
 
         snapshot = CodingTaskSnapshot(
             project_name=active_project.project_name,
@@ -1527,19 +1558,21 @@ class FinalizeCodingTaskTool(Tool):
         self,
         verification_results: str | None = None,
         remaining_risks: str | None = None,
-        relative_path: str = ".",
+        relative_path: str | None = None,
     ) -> str:
         """
         Return final git state for completing a coding task.
 
         :param verification_results: optional concise summary of validation commands and their results
         :param remaining_risks: optional concise risk summary for the final response
-        :param relative_path: project-relative file or directory used to choose the Git root
+        :param relative_path: project-relative file or directory used to choose the Git root; defaults to the latest prepare_coding_task focus
         :return: JSON final coding task snapshot
         """
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
-        focus_dir = _resolve_focus_dir(project_root, relative_path)
+        context = _load_coding_task_context(project_root) if relative_path is None else None
+        resolved_relative_path = relative_path or str((context or {}).get("focus_path") or ".")
+        focus_dir = _resolve_focus_dir(project_root, resolved_relative_path)
         focus_path = _relative_path(focus_dir, project_root)
         git_root = _resolve_git_root(project_root, focus_dir)
         snapshot = {
