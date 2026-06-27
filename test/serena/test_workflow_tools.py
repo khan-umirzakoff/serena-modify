@@ -18,6 +18,7 @@ from serena.tools.workflow_tools import (
     _parse_validation_diagnostics,
     _resolve_focus_dir,
     _resolve_review_target,
+    _run_git_snapshot,
     _save_goal_state,
     _select_focused_validation_task,
     _select_validation_task,
@@ -555,6 +556,13 @@ def test_apply_patch_dry_run_multifile_does_not_write(tmp_path: Path) -> None:
     assert existing.read_text(encoding="utf-8") == "before\n"
     assert remove_me.read_text(encoding="utf-8") == "delete\n"
     assert not (tmp_path / "created.txt").exists()
+
+
+def test_run_git_snapshot_tolerates_leading_git(tmp_path: Path) -> None:
+    subprocess_result = _run_git_snapshot(tmp_path, ["git", "status", "--short"])
+
+    assert subprocess_result.command == "git status --short"
+    assert "git git" not in subprocess_result.command
 
 
 def test_validation_diagnostics_parser_extracts_ruff_and_pytest() -> None:

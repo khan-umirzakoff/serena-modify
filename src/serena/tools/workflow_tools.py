@@ -618,7 +618,8 @@ def _run_git_snapshot(project_root: Path, args: list[str]) -> CommandSnapshot:
     :param args: git arguments without the ``git`` executable
     :return: command snapshot
     """
-    command = ["git", *args]
+    normalized_args = args[1:] if args and args[0] == "git" else args
+    command = ["git", *normalized_args]
     try:
         result = subprocess.run(command, cwd=project_root, text=True, capture_output=True, timeout=10, check=False)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
@@ -721,7 +722,8 @@ def _task_catalog_agent_view(
     :return: model-facing task catalog view
     """
     compact_summary = full_catalog.summary()
-    task_count = int(compact_summary["task_count"])
+    task_count_value = compact_summary.get("task_count", 0)
+    task_count = task_count_value if isinstance(task_count_value, int) else 0
     omitted_task_count = max(0, task_count - len(returned_catalog.tasks))
 
     view: dict[str, Any] = {
