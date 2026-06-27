@@ -43,13 +43,36 @@ def test_terminal_context_marks_expected_nested_repo(tmp_path: Path) -> None:
     context_dir = project_root / ".serena"
     context_dir.mkdir()
     context_file = context_dir / "coding_task_context.json"
-    context_file.write_text('{"git_root": "' + str(nested_repo) + '"}', encoding="utf-8")
+    context_file.write_text(
+        '{"project_root": "' + str(project_root) + '", "git_root": "' + str(nested_repo) + '"}',
+        encoding="utf-8",
+    )
 
     warnings = _terminal_context_warnings(project_root, nested_repo)
 
     assert warnings
     assert "matches the latest prepare_coding_task nested Git root" in warnings[0]
     assert "active Serena project is different" not in warnings[0]
+
+
+def test_terminal_context_ignores_mismatched_expected_repo_context(tmp_path: Path) -> None:
+    project_root = tmp_path / "workspace"
+    nested_repo = project_root / "app"
+    nested_repo.mkdir(parents=True)
+    (nested_repo / ".git").mkdir()
+    context_dir = project_root / ".serena"
+    context_dir.mkdir()
+    context_file = context_dir / "coding_task_context.json"
+    other_project = tmp_path / "other"
+    context_file.write_text(
+        '{"project_root": "' + str(other_project) + '", "git_root": "' + str(nested_repo) + '"}',
+        encoding="utf-8",
+    )
+
+    warnings = _terminal_context_warnings(project_root, nested_repo)
+
+    assert warnings
+    assert "active Serena project is different" in warnings[0]
 
 
 def test_short_command_exits_and_returns_output(tmp_path: Path) -> None:

@@ -562,7 +562,12 @@ def test_apply_patch_dry_run_multifile_does_not_write(tmp_path: Path) -> None:
 
 
 def test_coding_task_context_round_trips_latest_focus(tmp_path: Path) -> None:
-    state = {"focus_path": "crm-frontend", "git_root": str(tmp_path / "crm-frontend")}
+    state = {
+        "project_root": str(tmp_path),
+        "active_project_name": "workspace",
+        "focus_path": "crm-frontend",
+        "git_root": str(tmp_path / "crm-frontend"),
+    }
 
     _save_coding_task_context(tmp_path, state)
 

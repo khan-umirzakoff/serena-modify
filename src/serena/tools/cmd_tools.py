@@ -27,6 +27,7 @@ MAX_EMPTY_POLL_YIELD_TIME_MS = 300_000
 DEFAULT_MAX_OUTPUT_TOKENS = 10_000
 MAX_LIVE_TERMINAL_SESSIONS = 64
 PROTECTED_RECENT_TERMINAL_SESSIONS = 8
+EXPECTED_CODING_CONTEXT_MAX_AGE_SECONDS = 12 * 60 * 60
 INTERRUPT = "\u0003"
 TERMINAL_SIGNAL_NAMES: dict[str, signal.Signals] = {
     "INT": signal.SIGINT,
@@ -595,21 +596,33 @@ def _resolve_workdir(project_root: str, workdir: str | None) -> Path:
 
 def _load_expected_coding_git_root(project_root: Path) -> Path | None:
     """
-    Return the latest coding-task Git root recorded by ``prepare_coding_task``.
+    Return a fresh coding-task Git root recorded by ``prepare_coding_task``.
     """
     context_path = project_root / ".serena" / "coding_task_context.json"
     if not context_path.is_file():
         return None
     try:
+        if time.time() - context_path.stat().st_mtime > EXPECTED_CODING_CONTEXT_MAX_AGE_SECONDS:
+            return None
         context = json.loads(context_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(context, dict):
         return None
+
+    context_project_root = context.get("project_root")
+    if not isinstance(context_project_root, str) or Path(context_project_root).resolve() != project_root.resolve():
+        return None
+
     git_root = context.get("git_root")
     if not isinstance(git_root, str):
         return None
-    return Path(git_root).resolve()
+    resolved_git_root = Path(git_root).resolve()
+    try:
+        resolved_git_root.relative_to(project_root.resolve())
+    except ValueError:
+        return None
+    return resolved_git_root
 
 
 def _find_enclosing_git_root(path: Path) -> Path | None:

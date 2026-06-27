@@ -1434,13 +1434,17 @@ class PrepareCodingTaskTool(Tool):
         task_catalog = full_task_catalog.filtered(include_internal=False, max_tasks=15)
 
         git_root = _resolve_git_root(project_root, focus_dir)
+        now = _utc_now()
         _save_coding_task_context(
             project_root,
             {
+                "project_root": str(project_root),
+                "active_project_name": active_project.project_name,
                 "relative_path": relative_path,
                 "focus_path": focus_path,
                 "git_root": str(git_root),
-                "updated_at": _utc_now(),
+                "created_at": now,
+                "updated_at": now,
             },
         )
 
