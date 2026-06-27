@@ -56,6 +56,7 @@ class CodingTaskSnapshot:
     active_plan: dict[str, Any] | None
     git_status: CommandSnapshot
     git_diff_stat: CommandSnapshot
+    git_diff_cached_stat: CommandSnapshot
 
 
 GOAL_STATE_FILENAME = "goal_state.json"
@@ -1461,6 +1462,7 @@ class PrepareCodingTaskTool(Tool):
             active_plan=_compact_plan_public_state(project_root),
             git_status=_run_git_snapshot(git_root, ["status", "--short"]),
             git_diff_stat=_run_git_snapshot(git_root, ["diff", "--stat"]),
+            git_diff_cached_stat=_run_git_snapshot(git_root, ["diff", "--cached", "--stat"]),
         )
 
         return json.dumps(asdict(snapshot), ensure_ascii=False, indent=2)
@@ -1584,7 +1586,9 @@ class FinalizeCodingTaskTool(Tool):
             "active_plan": _plan_public_state(project_root),
             "git_status": asdict(_run_git_snapshot(git_root, ["status", "--short"])),
             "git_diff_stat": asdict(_run_git_snapshot(git_root, ["diff", "--stat"])),
+            "git_diff_cached_stat": asdict(_run_git_snapshot(git_root, ["diff", "--cached", "--stat"])),
             "git_diff_names": asdict(_run_git_snapshot(git_root, ["diff", "--name-only"])),
+            "git_diff_cached_names": asdict(_run_git_snapshot(git_root, ["diff", "--cached", "--name-only"])),
             "validation_results": verification_results,
             "remaining_risks": remaining_risks,
             "final_response_contract": ["result", "changed_files", "validation", "risks"],
