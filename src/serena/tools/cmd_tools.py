@@ -593,6 +593,25 @@ def _resolve_workdir(project_root: str, workdir: str | None) -> Path:
     return resolved
 
 
+def _load_expected_coding_git_root(project_root: Path) -> Path | None:
+    """
+    Return the latest coding-task Git root recorded by ``prepare_coding_task``.
+    """
+    context_path = project_root / ".serena" / "coding_task_context.json"
+    if not context_path.is_file():
+        return None
+    try:
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(context, dict):
+        return None
+    git_root = context.get("git_root")
+    if not isinstance(git_root, str):
+        return None
+    return Path(git_root).resolve()
+
+
 def _find_enclosing_git_root(path: Path) -> Path | None:
     """
     Return the nearest enclosing Git repository root.
@@ -623,12 +642,21 @@ def _terminal_context_warnings(project_root: Path, workdir: Path) -> list[str]:
 
     workdir_git_root = _find_enclosing_git_root(workdir)
     if workdir_git_root is not None and workdir_git_root.resolve() != project_root:
-        warnings.append(
-            "Terminal workdir is inside a nested Git repository while the active Serena project is different. "
-            f"Nested Git root: {workdir_git_root.resolve()}. Active project root: {project_root}. "
-            "Terminal commands will run in the nested repo, but semantic tools and task discovery still use the active project; "
-            "call activate_project(...) for that repo if intended."
-        )
+        resolved_workdir_git_root = workdir_git_root.resolve()
+        expected_git_root = _load_expected_coding_git_root(project_root)
+        if expected_git_root == resolved_workdir_git_root:
+            warnings.append(
+                "Terminal workdir matches the latest prepare_coding_task nested Git root. "
+                f"Nested Git root: {resolved_workdir_git_root}. Active Serena workspace root: {project_root}. "
+                "Terminal commands are scoped to the expected nested repo."
+            )
+        else:
+            warnings.append(
+                "Terminal workdir is inside a nested Git repository while the active Serena project is different. "
+                f"Nested Git root: {resolved_workdir_git_root}. Active project root: {project_root}. "
+                "Terminal commands will run in the nested repo, but semantic tools and task discovery still use the active project; "
+                "call activate_project(...) for that repo if intended."
+            )
 
     return warnings
 
