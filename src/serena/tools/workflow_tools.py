@@ -42,6 +42,7 @@ class CodingTaskSnapshot:
     project_name: str
     project_root: str
     focus_path: str
+    git_root: str
     context: str
     modes: list[str]
     active_tools: list[str]
@@ -399,6 +400,30 @@ def _validate_plan(plan: list[dict[str, Any]]) -> None:
 def _format_plan_markdown(plan: list[dict[str, Any]]) -> str:
     markers = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
     return "\n".join(f"- {markers.get(item['status'], '[ ]')} {item['step']}" for item in plan)
+
+
+def _resolve_git_root(project_root: Path, focus_dir: Path) -> Path:
+    """Nearest Git repository root for a scoped coding task."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=focus_dir,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return project_root
+
+    git_root_text = result.stdout.strip()
+    if result.returncode != 0 or not git_root_text:
+        return project_root
+
+    git_root = Path(git_root_text).resolve()
+    if git_root == project_root or project_root in git_root.parents:
+        return git_root
+    return project_root
 
 
 def _run_git_text(project_root: Path, command: list[str], max_chars: int = 12000) -> dict[str, Any]:
@@ -1385,10 +1410,13 @@ class PrepareCodingTaskTool(Tool):
         full_task_catalog = discover_task_catalog(project_root, relative_path=relative_path)
         task_catalog = full_task_catalog.filtered(include_internal=False, max_tasks=15)
 
+        git_root = _resolve_git_root(project_root, focus_dir)
+
         snapshot = CodingTaskSnapshot(
             project_name=active_project.project_name,
             project_root=str(project_root),
             focus_path=focus_path,
+            git_root=str(git_root),
             context=context,
             modes=modes,
             active_tools=active_tools,
@@ -1400,8 +1428,8 @@ class PrepareCodingTaskTool(Tool):
             active_goal=_compact_goal_public_state(project_root),
             active_goal_runtime_prompts=None,
             active_plan=_compact_plan_public_state(project_root),
-            git_status=_run_git_snapshot(project_root, ["status", "--short"]),
-            git_diff_stat=_run_git_snapshot(project_root, ["diff", "--stat"]),
+            git_status=_run_git_snapshot(git_root, ["status", "--short"]),
+            git_diff_stat=_run_git_snapshot(git_root, ["diff", "--stat"]),
         )
 
         return json.dumps(asdict(snapshot), ensure_ascii=False, indent=2)
@@ -1495,24 +1523,35 @@ class FinalizeCodingTaskTool(Tool):
     Produces a final coding task snapshot.
     """
 
-    def apply(self, verification_results: str | None = None, remaining_risks: str | None = None) -> str:
+    def apply(
+        self,
+        verification_results: str | None = None,
+        remaining_risks: str | None = None,
+        relative_path: str = ".",
+    ) -> str:
         """
         Return final git state for completing a coding task.
 
         :param verification_results: optional concise summary of validation commands and their results
         :param remaining_risks: optional concise risk summary for the final response
+        :param relative_path: project-relative file or directory used to choose the Git root
         :return: JSON final coding task snapshot
         """
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
+        focus_dir = _resolve_focus_dir(project_root, relative_path)
+        focus_path = _relative_path(focus_dir, project_root)
+        git_root = _resolve_git_root(project_root, focus_dir)
         snapshot = {
             "project_name": active_project.project_name,
             "project_root": str(project_root),
+            "focus_path": focus_path,
+            "git_root": str(git_root),
             "active_goal": _goal_public_state(project_root),
             "active_plan": _plan_public_state(project_root),
-            "git_status": asdict(_run_git_snapshot(project_root, ["status", "--short"])),
-            "git_diff_stat": asdict(_run_git_snapshot(project_root, ["diff", "--stat"])),
-            "git_diff_names": asdict(_run_git_snapshot(project_root, ["diff", "--name-only"])),
+            "git_status": asdict(_run_git_snapshot(git_root, ["status", "--short"])),
+            "git_diff_stat": asdict(_run_git_snapshot(git_root, ["diff", "--stat"])),
+            "git_diff_names": asdict(_run_git_snapshot(git_root, ["diff", "--name-only"])),
             "validation_results": verification_results,
             "remaining_risks": remaining_risks,
             "final_response_contract": ["result", "changed_files", "validation", "risks"],

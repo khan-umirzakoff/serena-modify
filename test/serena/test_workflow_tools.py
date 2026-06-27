@@ -17,6 +17,7 @@ from serena.tools.workflow_tools import (
     _normalize_validation_id,
     _parse_validation_diagnostics,
     _resolve_focus_dir,
+    _resolve_git_root,
     _resolve_review_target,
     _run_git_snapshot,
     _save_goal_state,
@@ -556,6 +557,26 @@ def test_apply_patch_dry_run_multifile_does_not_write(tmp_path: Path) -> None:
     assert existing.read_text(encoding="utf-8") == "before\n"
     assert remove_me.read_text(encoding="utf-8") == "delete\n"
     assert not (tmp_path / "created.txt").exists()
+
+
+def test_resolve_git_root_prefers_nested_repo(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    subrepo = workspace / "crm-frontend"
+    subrepo.mkdir(parents=True)
+
+    import subprocess
+
+    subprocess.run(["git", "init"], cwd=subrepo, check=True, capture_output=True, text=True)
+
+    assert _resolve_git_root(workspace, subrepo) == subrepo.resolve()
+
+
+def test_resolve_git_root_falls_back_to_workspace_without_repo(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    nested = workspace / "crm-frontend"
+    nested.mkdir(parents=True)
+
+    assert _resolve_git_root(workspace, nested) == workspace
 
 
 def test_run_git_snapshot_tolerates_leading_git(tmp_path: Path) -> None:
