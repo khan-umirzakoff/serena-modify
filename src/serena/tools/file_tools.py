@@ -83,6 +83,59 @@ class CreateTextFileTool(EditingToolWithDiagnostics):
             return diagnostics_context.format_result(answer)
 
 
+class CreateDirectoryTool(Tool):
+    """
+    Creates a directory within the project without requiring a shell command.
+    """
+
+    def apply(self, relative_path: str, exist_ok: bool = True) -> str:
+        """
+        Create a project-relative directory.
+
+        :param relative_path: the project-relative directory path to create
+        :param exist_ok: whether an existing directory should be treated as success
+        :return: a JSON result with the created directory path
+        """
+        project_root = Path(self.get_project_root()).resolve()
+        abs_path = (project_root / relative_path).resolve()
+        if not abs_path.is_relative_to(project_root):
+            raise ValueError(f"Cannot create directory outside project root: {relative_path}")
+        if abs_path.exists() and not abs_path.is_dir():
+            raise ValueError(f"Path exists and is not a directory: {relative_path}")
+        abs_path.mkdir(parents=True, exist_ok=exist_ok)
+        return self._to_json({"created_directory": relative_path, "exists": abs_path.exists()})
+
+
+class CreateOrReplaceFileTool(EditingToolWithDiagnostics):
+    """
+    Creates or replaces a project file with explicit overwrite control.
+    """
+
+    def apply(self, relative_path: str, content: str, overwrite: bool = False) -> str:
+        """
+        Write a project-relative file without a shell script.
+
+        :param relative_path: the project-relative file path to write
+        :param content: text content to write
+        :param overwrite: whether an existing file may be replaced
+        :return: a message indicating success or refusal
+        """
+        with self.DiagnosticsContext(self, relative_path) as diagnostics_context:
+            project_root = Path(self.get_project_root()).resolve()
+            abs_path = (project_root / relative_path).resolve()
+            if not abs_path.is_relative_to(project_root):
+                raise ValueError(f"Cannot write file outside project root: {relative_path}")
+            existed = abs_path.exists()
+            if existed and not overwrite:
+                raise ValueError(f"File already exists: {relative_path}; pass overwrite=true to replace it")
+            if existed:
+                self.project.validate_relative_path(relative_path, require_not_ignored=True)
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_text(content, encoding=self.project.project_config.encoding, newline=self.project.line_ending.newline_str)
+            action = "replaced" if existed else "created"
+            return diagnostics_context.format_result(f"File {action}: {relative_path}.")
+
+
 class ListDirTool(Tool):
     """
     Lists files and directories in the given directory (optionally with recursion).

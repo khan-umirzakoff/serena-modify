@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from serena.tools import Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
-from serena.tools.skill_tools import SkillMetadata, discover_skills, render_skills_summary
+from serena.tools.skill_tools import SkillMetadata, discover_skills, render_skills_summary, skill_dependency_reports
 from serena.tools.task_catalog import VALIDATION_KINDS, TaskCatalog, ValidationHints, discover_task_catalog, infer_validation_hints
 
 
@@ -57,6 +57,7 @@ class CodingTaskSnapshot:
     active_plan: dict[str, Any] | None
     available_skills: list[SkillMetadata]
     skills_summary: str | None
+    skill_dependency_report: dict[str, Any]
     git_status: CommandSnapshot
     git_diff_stat: CommandSnapshot
     git_diff_cached_stat: CommandSnapshot
@@ -1437,6 +1438,7 @@ class PrepareCodingTaskTool(Tool):
         task_catalog = full_task_catalog.filtered(include_internal=False, max_tasks=15)
         skills_outcome = discover_skills(project_root, focus_dir)
         skills_summary = render_skills_summary(skills_outcome.skills)
+        skill_dependency_report = skill_dependency_reports(skills_outcome.skills, set(self.agent.get_active_tool_names()))
 
         git_root = _resolve_git_root(project_root, focus_dir)
         now = _utc_now()
@@ -1471,6 +1473,7 @@ class PrepareCodingTaskTool(Tool):
             active_plan=_compact_plan_public_state(project_root),
             available_skills=skills_outcome.skills,
             skills_summary=skills_summary,
+            skill_dependency_report=skill_dependency_report,
             git_status=_run_git_snapshot(git_root, ["status", "--short"]),
             git_diff_stat=_run_git_snapshot(git_root, ["diff", "--stat"]),
             git_diff_cached_stat=_run_git_snapshot(git_root, ["diff", "--cached", "--stat"]),
@@ -1523,6 +1526,11 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "source": "Use run_validation for common checks like lint, test, typecheck, format, build, or verify; use get_validation_commands/discover_project_tasks only when choosing is ambiguous.",
                 "behavior": "Run validation when practical. If blocked by missing tools or environment setup, report the blocker precisely.",
             },
+            "skills": {
+                "discovery": "prepare_coding_task and discover_skills expose only skill metadata and source path, not full instructions.",
+                "progressive_disclosure": "Before following a skill, call read_skill with the skill name or source path.",
+                "policy": "Respect skill policy, resources, and dependency_report before use.",
+            },
             "review": {
                 "start": "Use prepare_review_task for review requests, then inspect the returned diff/context and produce prioritized findings.",
                 "finish": "Use finalize_review_task to wrap review output when the user initiated a review workflow.",
@@ -1555,6 +1563,8 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "finalize_review_task",
                 "get_validation_commands",
                 "run_validation",
+                "discover_skills",
+                "read_skill",
                 "finalize_coding_task",
             ],
             "final_response_contract": ["what changed", "changed files", "validation", "running services", "risks"],

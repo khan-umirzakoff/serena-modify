@@ -1,0 +1,23 @@
+short-description: Serena MCP harness workflow
+policy:
+  allow_implicit_invocation: true
+  allow_scripts: false
+  allowed_tools:
+    - prepare_coding_task
+    - discover_skills
+    - read_skill
+    - run_validation
+    - finalize_coding_task
+dependencies:
+  tools:
+    - prepare_coding_task
+    - discover_skills
+    - read_skill
+    - run_validation
+  mcp_servers:
+    - SERENA_MCP_local
+resources:
+  references:
+    - references/workflow.md
+  scripts: []
+  assets: []
