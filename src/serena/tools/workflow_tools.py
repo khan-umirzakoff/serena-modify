@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from serena.tools import Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
+from serena.tools.skill_tools import SkillMetadata, discover_skills, render_skills_summary
 from serena.tools.task_catalog import VALIDATION_KINDS, TaskCatalog, ValidationHints, discover_task_catalog, infer_validation_hints
 
 
@@ -54,6 +55,8 @@ class CodingTaskSnapshot:
     active_goal: dict[str, Any] | None
     active_goal_runtime_prompts: dict[str, Any] | None
     active_plan: dict[str, Any] | None
+    available_skills: list[SkillMetadata]
+    skills_summary: str | None
     git_status: CommandSnapshot
     git_diff_stat: CommandSnapshot
     git_diff_cached_stat: CommandSnapshot
@@ -1432,6 +1435,8 @@ class PrepareCodingTaskTool(Tool):
         context, modes, active_tools = _active_serena_state(self.agent)
         full_task_catalog = discover_task_catalog(project_root, relative_path=relative_path)
         task_catalog = full_task_catalog.filtered(include_internal=False, max_tasks=15)
+        skills_outcome = discover_skills(project_root, focus_dir)
+        skills_summary = render_skills_summary(skills_outcome.skills)
 
         git_root = _resolve_git_root(project_root, focus_dir)
         now = _utc_now()
@@ -1464,6 +1469,8 @@ class PrepareCodingTaskTool(Tool):
             active_goal=_compact_goal_public_state(project_root),
             active_goal_runtime_prompts=None,
             active_plan=_compact_plan_public_state(project_root),
+            available_skills=skills_outcome.skills,
+            skills_summary=skills_summary,
             git_status=_run_git_snapshot(git_root, ["status", "--short"]),
             git_diff_stat=_run_git_snapshot(git_root, ["diff", "--stat"]),
             git_diff_cached_stat=_run_git_snapshot(git_root, ["diff", "--cached", "--stat"]),
