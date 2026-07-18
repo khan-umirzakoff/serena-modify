@@ -63,6 +63,7 @@ from serena.util.inspection import iter_subclasses
 from serena.util.logging import MemoryLogHandler
 from solidlsp.ls_config import Language
 from solidlsp.util import subprocess_util
+from solidlsp.util.subprocess_util import terminate_process_tree_with_kill_fallback
 
 if TYPE_CHECKING:
     from serena.gui_log_viewer import GuiLogViewer
@@ -640,12 +641,10 @@ class SerenaAgent:
         # determine the effective language backend for this session.
         # If a startup project is provided and has a per-project override, use it; otherwise use the global config.
         # Since we don't want to change the toolset after startup, the language backend cannot be changed within a running Serena session
-        self._language_backend = self.serena_config.language_backend
-        if registered_project_to_activate is not None and registered_project_to_activate.project_config.language_backend is not None:
-            self._language_backend = registered_project_to_activate.project_config.language_backend
-            log.info(f"Using language backend as configured in project.yml: {self._language_backend.name}")
-        else:
-            log.info(f"Using language backend from global configuration: {self._language_backend.name}")
+        self._language_backend = self.serena_config.determine_language_backend(
+            project_config=registered_project_to_activate.project_config if registered_project_to_activate is not None else None,
+            log_choice=True,
+        )
 
         # create the tool names mapping for prompts
         self._prompt_tool_names_mapping = self._create_prompt_tool_names_mapping(self._language_backend)
@@ -1201,16 +1200,78 @@ class SerenaAgent:
         if update_active_tools:
             self._update_active_tools()
 
-        def init_language_server_manager() -> None:
-            # start the language server
+        def init_project_services() -> None:
+            self._run_project_activation_command(project)
+            self._init_active_project_language_backend()
+
+        # initialise the project's language backend in the background
+        self.issue_task(init_project_services)
+
+        if self._project_activation_callback is not None:
+            self._project_activation_callback()
+
+        # notify the dashboard manager of the project change (if applicable)
+        if self._dashboard_manager:
+            self._dashboard_manager.update_active_project(self._active_project)
+
+        return True
+
+    @staticmethod
+    def _run_project_activation_command(project: Project) -> None:
+        """
+        Runs the given project's activation_command (if set and the project is trusted).
+        Failures are logged.
+        """
+        activation_command = project.project_config.activation_command
+        if not activation_command:
+            return
+        if not project.is_trusted():
+            log.warning(
+                f"Project path {project.project_root} is not trusted, ignoring activation_command "
+                "from project configuration. To trust the project, modify the trusted path patterns "
+                "in the global configuration."
+            )
+            return
+        timeout = project.project_config.activation_command_timeout
+        cmd = subprocess_util.convert_shell_cmd(activation_command)
+        log.info(f"Running activation_command for project '{project.project_name}': {cmd}")
+        try:
+            with LogTime("Project activation command", logger=log):
+                p = subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    cwd=project.project_root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **subprocess_util.subprocess_kwargs(),
+                )
+                try:
+                    _, stderr = p.communicate(timeout=timeout)
+                    if p.returncode != 0:
+                        log.error(f"activation_command for project '{project.project_name}' failed (exit {p.returncode}): {stderr.strip()}")
+                except subprocess.TimeoutExpired:
+                    log.error(
+                        f"Activation_command for project '{project.project_name}' timed out after "
+                        f"{timeout}s; terminating process and continuing with backend initialisation."
+                    )
+                    terminate_process_tree_with_kill_fallback(p, terminate_timeout=5.0, process_name="activation_command")
+        except Exception:
+            log.exception(f"Unexpected error running activation_command for project '{project.project_name}'")
+
+    def _init_active_project_language_backend(self) -> None:
+        """
+        Initialises the active project's language backend
+        """
+        project = self._active_project
+        assert project is not None
+
+        # for LSP mode, start the language server manager
+        if self.get_language_backend().is_lsp():
             with LogTime("Language server initialization", logger=log):
                 self.reset_language_server_manager()
 
-        # initialize the language server in the background (if in language server mode)
-        if self.get_language_backend().is_lsp():
-            self.issue_task(init_language_server_manager)
-
-        def init_jetbrains_ide() -> None:
+        # for JetBrains mode, search for plugin server and spawn IDE (if not found and launch command provided)
+        elif self.get_language_backend().is_jetbrains():
             try:
                 client = jetbrains_plugin_client.JetBrainsPluginClient.from_project(project, log_warning=False)
                 log.info("Found Serena JetBrains Plugin server: %s", client)
@@ -1223,19 +1284,6 @@ class SerenaAgent:
                     stdout, stderr = p.communicate()
                     if p.returncode != 0:
                         log.error(f"Failed to launch JetBrains IDE: {stderr.decode('utf-8')}")
-
-        # for JetBrains mode, search for plugin server and spawn IDE if not found and enabled
-        if self.get_language_backend().is_jetbrains():
-            self.issue_task(init_jetbrains_ide)
-
-        if self._project_activation_callback is not None:
-            self._project_activation_callback()
-
-        # notify the dashboard manager of the project change (if applicable)
-        if self._dashboard_manager:
-            self._dashboard_manager.update_active_project(self._active_project)
-
-        return True
 
     def activate_project_from_path_or_name(
         self, project_root_or_name: str, update_active_modes: bool = True, update_active_tools: bool = True
@@ -1252,7 +1300,7 @@ class SerenaAgent:
         if project_instance is not None:
             log.info(f"Found registered project '{project_instance.project_name}' at path {project_instance.project_root}")
         elif os.path.isdir(project_root_or_name):
-            project_instance = self.serena_config.add_project_from_path(project_root_or_name)
+            project_instance = self.serena_config.add_project_from_path(project_root_or_name, asynchronous_autogen=True)
             log.info(f"Added new project {project_instance.project_name} for path {project_instance.project_root}")
 
         if project_instance is None:
@@ -1357,7 +1405,7 @@ class SerenaAgent:
         self.issue_task(lambda: self.get_active_project_or_raise().remove_language(language), name=f"RemoveLanguage:{language.value}")
 
     def get_tool(self, tool_class: type[TTool]) -> TTool:
-        return self._all_tools[tool_class]  # type: ignore
+        return self._all_tools[tool_class]
 
     def print_tool_overview(self) -> None:
         ToolRegistry().print_tool_overview(self._active_tools.tools)

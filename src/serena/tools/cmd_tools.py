@@ -12,8 +12,9 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import cast
 
 from serena.tools import Tool, ToolMarkerCanEdit
 from solidlsp.util.subprocess_util import subprocess_kwargs, terminate_process_tree_with_kill_fallback
@@ -470,6 +471,7 @@ class TerminalProcessManager:
             assert process.stdout is not None
             output_fd = os.dup(process.stdout.fileno())
             write_fd = None
+        process = cast(subprocess.Popen[bytes], process)
         session = TerminalSession(
             session_id=session_id,
             command=command,
@@ -488,7 +490,7 @@ class TerminalProcessManager:
             raise
         response = session.collect_response(_bounded(yield_time_ms, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS))
         if pty_requested_but_pipe_used:
-            response = TerminalResponse(**{**asdict(response), "pty_requested_but_pipe_used": True})
+            response = replace(response, pty_requested_but_pipe_used=True)
         self._unregister_if_exited(session)
         return response
 
@@ -681,7 +683,7 @@ def _with_context_warnings(response: TerminalResponse, project_root: Path, workd
     warnings = [*response.warnings, *_terminal_context_warnings(project_root, workdir)]
     if not warnings:
         return response
-    return TerminalResponse(**{**asdict(response), "warnings": warnings})
+    return replace(response, warnings=warnings)
 
 
 class ExecuteShellCommandTool(Tool, ToolMarkerCanEdit):

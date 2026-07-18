@@ -227,11 +227,9 @@ def _make_config_with_project(
 ) -> tuple[SerenaConfig, str]:
     """Create a SerenaConfig with a single registered project and return (config, project_name)."""
     config = SerenaConfig(
-        gui_log_window=False,
-        web_dashboard=False,
         log_level=logging.ERROR,
         language_backend=global_backend,
-    )
+    ).with_headless_mode_overrides()
     project = Project(
         project_root=str(Path(__file__).parent.parent / "resources" / "repos" / "python" / "test_repo"),
         project_config=ProjectConfig(
@@ -271,11 +269,9 @@ class TestEffectiveLanguageBackend:
     def test_no_project_uses_global_backend(self):
         """When no startup project is provided, effective backend is the global one."""
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             log_level=logging.ERROR,
             language_backend=LanguageBackend.LSP,
-        )
+        ).with_headless_mode_overrides()
         agent = SerenaAgent(project=None, serena_config=config)
         try:
             assert agent.get_language_backend() == LanguageBackend.LSP
@@ -357,90 +353,68 @@ class TestGetConfiguredProjectSerenaFolder:
     """Tests for SerenaConfig.get_configured_project_serena_folder (pure template resolution)."""
 
     def test_default_location(self):
-        config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
-        )
+        config = SerenaConfig().with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/myproject")
         assert result == os.path.abspath("/home/user/myproject/.serena")
 
     def test_custom_location_with_project_folder_name(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/projects-metadata/$projectFolderName/.serena",
-        )
+        ).with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/myproject")
         assert result == os.path.abspath("/projects-metadata/myproject/.serena")
 
     def test_custom_location_with_project_dir(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="$projectDir/.custom-serena",
-        )
+        ).with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/myproject")
         assert result == os.path.abspath("/home/user/myproject/.custom-serena")
 
     def test_custom_location_with_both_placeholders(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/data/$projectFolderName/$projectDir/.serena",
-        )
+        ).with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/proj")
         assert result == os.path.abspath("/data/proj/home/user/proj/.serena")
 
     def test_default_field_value(self):
-        config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
-        )
+        config = SerenaConfig().with_headless_mode_overrides()
         assert config.project_serena_folder_location == DEFAULT_PROJECT_SERENA_FOLDER_LOCATION
 
     def test_rejects_unknown_placeholder(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="$projectDir/$unknownVar/.serena",
-        )
+        ).with_headless_mode_overrides()
         with pytest.raises(SerenaConfigError, match=r"Unknown placeholder '\$unknownVar'"):
             config.get_configured_project_serena_folder("/home/user/myproject")
 
     def test_rejects_typo_projectDirs(self):
         """$projectDirs should not be silently treated as $projectDir + 's'."""
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="$projectDirs/.serena",
-        )
+        ).with_headless_mode_overrides()
         with pytest.raises(SerenaConfigError, match=r"Unknown placeholder '\$projectDirs'"):
             config.get_configured_project_serena_folder("/home/user/myproject")
 
     def test_rejects_typo_projectfoldername_lowercase(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/data/$projectfoldername/.serena",
-        )
+        ).with_headless_mode_overrides()
         with pytest.raises(SerenaConfigError, match=r"Unknown placeholder '\$projectfoldername'"):
             config.get_configured_project_serena_folder("/home/user/myproject")
 
     def test_no_placeholders_is_valid(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/fixed/path/.serena",
-        )
+        ).with_headless_mode_overrides()
         result = config.get_configured_project_serena_folder("/home/user/myproject")
         assert result == os.path.abspath("/fixed/path/.serena")
 
     def test_error_message_lists_supported_placeholders(self):
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="$bogus/.serena",
-        )
+        ).with_headless_mode_overrides()
         with pytest.raises(SerenaConfigError, match=r"\$projectDir.*\$projectFolderName|\$projectFolderName.*\$projectDir"):
             config.get_configured_project_serena_folder("/home/user/myproject")
 
@@ -471,7 +445,7 @@ class TestProjectSerenaDataFolder:
         return project
 
     def test_default_config_creates_in_project_dir(self):
-        config = SerenaConfig(gui_log_window=False, web_dashboard=False)
+        config = SerenaConfig().with_headless_mode_overrides()
         project = self._make_project(config)
         expected = os.path.abspath(str(self.project_path / SERENA_MANAGED_DIR_NAME))
         assert project.path_to_serena_data_folder() == expected
@@ -480,10 +454,8 @@ class TestProjectSerenaDataFolder:
         custom_base = Path(self.test_dir) / "metadata"
         custom_base.mkdir()
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location=str(custom_base) + "/$projectFolderName/.serena",
-        )
+        ).with_headless_mode_overrides()
         project = self._make_project(config)
         expected = os.path.abspath(str(custom_base / "myproject" / ".serena"))
         assert project.path_to_serena_data_folder() == expected
@@ -493,10 +465,8 @@ class TestProjectSerenaDataFolder:
         existing_serena = self.project_path / SERENA_MANAGED_DIR_NAME
         existing_serena.mkdir()
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location="/nonexistent/path/$projectFolderName/.serena",
-        )
+        ).with_headless_mode_overrides()
         project = self._make_project(config)
         assert project.path_to_serena_data_folder() == str(existing_serena)
 
@@ -510,10 +480,8 @@ class TestProjectSerenaDataFolder:
         custom_serena.mkdir(parents=True)
 
         config = SerenaConfig(
-            gui_log_window=False,
-            web_dashboard=False,
             project_serena_folder_location=str(custom_base) + "/$projectFolderName/.serena",
-        )
+        ).with_headless_mode_overrides()
         project = self._make_project(config)
         assert project.path_to_serena_data_folder() == str(custom_serena)
 
@@ -658,3 +626,51 @@ class TestMemoriesManagerCustomPath:
         manager.save_memory("topic_b", "content b", is_tool_context=False)
         memories = manager.list_project_memories()
         assert sorted(memories.get_full_list()) == ["topic_a", "topic_b"]
+
+
+class TestProjectConfigActivationCommand:
+    """Tests for the activation_command and activation_command_timeout fields."""
+
+    def _base_data(self) -> dict:
+        data, _ = ProjectConfig._load_yaml_dict(PROJECT_TEMPLATE_FILE)
+        data["project_name"] = "test"
+        data["languages"] = ["python"]
+        return data
+
+    def test_activation_command_defaults_to_none(self):
+        config = ProjectConfig(project_name="test", languages=[Language.PYTHON])
+        assert config.activation_command is None
+
+    def test_activation_command_timeout_default(self):
+        config = ProjectConfig(project_name="test", languages=[Language.PYTHON])
+        assert config.activation_command_timeout == 180.0
+
+    def test_activation_command_parsed_from_dict(self):
+        data = self._base_data()
+        data["activation_command"] = "npx nx run-many -t build"
+        data["activation_command_timeout"] = 300
+        config = ProjectConfig._from_dict(data, local_override_keys=[])
+        assert config.activation_command == "npx nx run-many -t build"
+        assert config.activation_command_timeout == 300.0
+
+    def test_activation_command_defaults_when_absent(self):
+        data = self._base_data()
+        data.pop("activation_command", None)
+        data.pop("activation_command_timeout", None)
+        config = ProjectConfig._from_dict(data, local_override_keys=[])
+        assert config.activation_command is None
+        assert config.activation_command_timeout == 180.0
+
+    def test_activation_command_timeout_zero_raises(self):
+        data = self._base_data()
+        data["activation_command"] = "echo hi"
+        data["activation_command_timeout"] = 0
+        with pytest.raises(ValueError, match="activation_command_timeout must be positive"):
+            ProjectConfig._from_dict(data, local_override_keys=[])
+
+    def test_activation_command_timeout_negative_raises(self):
+        data = self._base_data()
+        data["activation_command"] = "echo hi"
+        data["activation_command_timeout"] = -10
+        with pytest.raises(ValueError, match="activation_command_timeout must be positive"):
+            ProjectConfig._from_dict(data, local_override_keys=[])
