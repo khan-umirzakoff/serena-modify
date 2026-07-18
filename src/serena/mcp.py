@@ -28,7 +28,7 @@ from serena.agent import (
 from serena.config.context_mode import SerenaAgentContext
 from serena.config.serena_config import LanguageBackend, ModeSelectionDefinition
 from serena.constants import DEFAULT_CONTEXT, SERENA_LOG_FORMAT
-from serena.mcp_workspaces import WorkspaceError, WorkspaceRegistry
+from serena.mcp_workspaces import WorkspaceError, WorkspaceMode, WorkspaceRegistry
 from serena.tools import Tool, ToolCallError
 from serena.util.exception import show_fatal_exception_safe
 from serena.util.logging import MemoryLogHandler
@@ -37,6 +37,16 @@ log = logging.getLogger(__name__)
 
 _workspace_id_context: ContextVar[str | None] = ContextVar("serena_workspace_id", default=None)
 WORKSPACE_MANAGEMENT_TOOLS = {"open_workspace", "list_workspaces", "close_workspace"}
+MULTI_WORKSPACE_INSTRUCTIONS = """
+This server is running in multi-workspace mode. At the start of each new chat or independent task, call
+open_workspace with the relevant project path or registered project name. Keep the returned workspace_id private
+to that chat and pass it to every subsequent Serena tool call. Never reuse another chat's workspace_id. If it
+expires, call open_workspace again. Call close_workspace when the task is finished and the workspace is no longer needed.
+""".strip()
+SINGLE_WORKSPACE_INSTRUCTIONS = """
+This server is running in single-workspace mode. Work directly in the active startup project. Workspace selection
+and workspace_id routing are intentionally disabled, so do not ask the user to select or open a workspace.
+""".strip()
 
 
 def configure_logging(*args, **kwargs) -> None:
@@ -197,6 +207,7 @@ class SerenaMCPFactory:
         context: str = DEFAULT_CONTEXT,
         project: str | None = None,
         memory_log_handler: MemoryLogHandler | None = None,
+        workspace_mode: WorkspaceMode = WorkspaceMode.SINGLE,
     ):
         """
         :param transport: The transport to use for the MCP server.
@@ -205,15 +216,28 @@ class SerenaMCPFactory:
             If the project passed here hasn't been registered yet, it will be registered automatically and can be activated by its name
             afterward.
         :param memory_log_handler: the in-memory log handler to use for the agent's logging
+        :param workspace_mode: project-routing mode. Single mode uses only the startup project; multi mode exposes
+            explicit workspace management and per-call routing.
         """
         self.transport = transport
         self.context = SerenaAgentContext.load(context)
+        self.workspace_mode = workspace_mode
         self.project = project
         self.agent: SerenaAgent | None = None
         self.memory_log_handler = memory_log_handler
         self._workspace_registry: WorkspaceRegistry | None = None
         self._agent_config: SerenaConfig | None = None
         self._mode_selection_def: ModeSelectionDefinition | None = None
+
+        # align optional workspace tools with the selected routing mode
+        if not workspace_mode.is_multi and project is not None:
+            self.context.single_project = True
+        included_optional_tools = set(self.context.included_optional_tools)
+        if workspace_mode.is_multi:
+            included_optional_tools.update(WORKSPACE_MANAGEMENT_TOOLS)
+        else:
+            included_optional_tools.difference_update(WORKSPACE_MANAGEMENT_TOOLS)
+        self.context.included_optional_tools = tuple(sorted(included_optional_tools))
 
     @staticmethod
     def _sanitize_for_openai_tools(schema: dict) -> dict:
@@ -376,8 +400,8 @@ class SerenaMCPFactory:
                     tool,
                     openai_tool_compatible=openai_tool_compatible,
                     structured_output=structured_output,
-                    tool_resolver=self._resolve_tool,
-                    workspace_routing=tool.get_name() not in WORKSPACE_MANAGEMENT_TOOLS,
+                    tool_resolver=self._resolve_tool if self.workspace_mode.is_multi else None,
+                    workspace_routing=self.workspace_mode.is_multi and tool.get_name() not in WORKSPACE_MANAGEMENT_TOOLS,
                 )
                 mcp._tool_manager._tools[tool.get_name()] = mcp_tool
             log.info(f"Starting MCP server with {len(mcp._tool_manager._tools)} tools: {list(mcp._tool_manager._tools.keys())}")
@@ -460,8 +484,9 @@ class SerenaMCPFactory:
             self._agent_config = deepcopy(config)
             self._mode_selection_def = mode_selection_def
             self.agent = self._create_serena_agent(config, mode_selection_def)
-            self._workspace_registry = WorkspaceRegistry(self._create_workspace_agent)
-            self.agent.set_workspace_registry(self._workspace_registry)
+            if self.workspace_mode.is_multi:
+                self._workspace_registry = WorkspaceRegistry(self._create_workspace_agent)
+                self.agent.set_workspace_registry(self._workspace_registry)
 
         except Exception as e:
             show_fatal_exception_safe(e)
@@ -513,4 +538,9 @@ class SerenaMCPFactory:
 
     def _get_initial_instructions(self) -> str:
         assert self.agent is not None
-        return self.agent.create_connection_prompt()
+        instructions = self.agent.create_connection_prompt()
+        if self.workspace_mode.is_multi:
+            return f"{instructions}\n\n{MULTI_WORKSPACE_INSTRUCTIONS}"
+        if self.project is not None:
+            return f"{instructions}\n\n{SINGLE_WORKSPACE_INSTRUCTIONS}"
+        return instructions

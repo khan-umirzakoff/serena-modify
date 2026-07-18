@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -13,6 +14,18 @@ if TYPE_CHECKING:
 
 
 DEFAULT_WORKSPACE_TTL_SECONDS = 6 * 60 * 60
+
+
+class WorkspaceMode(Enum):
+    """Operating mode for project routing on a shared MCP server."""
+
+    SINGLE = "single"
+    MULTI = "multi"
+
+    @property
+    def is_multi(self) -> bool:
+        """Return whether explicit multi-workspace routing is enabled."""
+        return self is WorkspaceMode.MULTI
 
 
 class WorkspaceError(Exception):

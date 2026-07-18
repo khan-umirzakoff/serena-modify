@@ -369,6 +369,35 @@ class TestProjectFromCwdMutualExclusivity:
         assert "cannot be used with" in result.output
 
 
+class TestWorkspaceModeValidation:
+    """Tests for explicit single- and multi-workspace server modes."""
+
+    def test_chatgpt_single_mode_requires_project(self, cli_runner):
+        result = cli_runner.invoke(
+            TopLevelCommands.start_mcp_server,
+            ["--context", "chatgpt", "--workspace-mode", "single"],
+        )
+
+        assert result.exit_code != 0
+        assert "requires --project" in result.output
+
+    def test_multi_mode_rejects_startup_project(self, cli_runner):
+        result = cli_runner.invoke(
+            TopLevelCommands.start_mcp_server,
+            ["--context", "chatgpt", "--workspace-mode", "multi", "--project", "/some/path"],
+        )
+
+        assert result.exit_code != 0
+        assert "cannot be used with --project" in result.output
+
+    def test_workspace_mode_is_documented(self, cli_runner):
+        result = cli_runner.invoke(TopLevelCommands.start_mcp_server, ["--help"])
+
+        assert result.exit_code == 0
+        assert "--workspace-mode [single|multi]" in result.output
+        assert "single uses only --project" in result.output
+
+
 if __name__ == "__main__":
     # For manual testing, you can run this file directly:
     # uv run pytest test/serena/test_cli_project_commands.py -v

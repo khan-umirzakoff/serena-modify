@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from serena.config.context_mode import SerenaAgentContext
-from serena.mcp_workspaces import WorkspaceNotFoundError, WorkspaceRegistry
+from serena.mcp import SerenaMCPFactory
+from serena.mcp_workspaces import WorkspaceMode, WorkspaceNotFoundError, WorkspaceRegistry
 from serena.tools.tools_base import ToolRegistry
 from serena.tools.workflow_tools import _coding_task_context_path, _goal_state_path, _plan_state_path
 
@@ -38,12 +38,48 @@ class FakeClock:
         return self.value
 
 
-def test_workspace_tools_are_registered_and_enabled_for_chatgpt() -> None:
+def test_workspace_tools_are_exposed_only_in_multi_mode() -> None:
     tool_names = ToolRegistry().get_tool_names()
-    context = SerenaAgentContext.load("chatgpt")
+    single_factory = SerenaMCPFactory(
+        transport="stdio",
+        context="chatgpt",
+        project="/project",
+        workspace_mode=WorkspaceMode.SINGLE,
+    )
+    multi_factory = SerenaMCPFactory(transport="stdio", context="chatgpt", workspace_mode=WorkspaceMode.MULTI)
 
     assert {"open_workspace", "list_workspaces", "close_workspace"} <= set(tool_names)
-    assert {"open_workspace", "list_workspaces", "close_workspace"} <= set(context.included_optional_tools)
+    assert single_factory.context.single_project is True
+    assert not ({"open_workspace", "list_workspaces", "close_workspace"} & set(single_factory.context.included_optional_tools))
+    assert multi_factory.context.single_project is False
+    assert {"open_workspace", "list_workspaces", "close_workspace"} <= set(multi_factory.context.included_optional_tools)
+
+
+def test_mcp_schema_matches_workspace_mode() -> None:
+    observed: dict[str, tuple[bool, bool]] = {}
+
+    for workspace_mode in WorkspaceMode:
+        factory = SerenaMCPFactory(transport="stdio", context="chatgpt", workspace_mode=workspace_mode)
+        server = factory.create_mcp_server(
+            enable_web_dashboard=False,
+            enable_gui_log_window=False,
+            open_web_dashboard=False,
+        )
+        assert factory.agent is not None
+        factory._set_mcp_tools(server, openai_tool_compatible=True, structured_output=False)
+        tools = server._tool_manager._tools
+        observed[workspace_mode.value] = (
+            "open_workspace" in tools,
+            "workspace_id" in tools["read_file"].parameters["properties"],
+        )
+        if factory._workspace_registry is not None:
+            factory._workspace_registry.shutdown()
+        factory.agent.on_shutdown()
+
+    assert observed == {
+        "single": (False, False),
+        "multi": (True, True),
+    }
 
 
 def test_workspace_registry_isolates_agents_and_closes_resources(tmp_path: Path) -> None:

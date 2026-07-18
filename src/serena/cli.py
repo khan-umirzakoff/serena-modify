@@ -36,6 +36,7 @@ from serena.constants import (
     SERENAS_OWN_CONTEXT_YAMLS_DIR,
     SERENAS_OWN_MODE_YAMLS_DIR,
 )
+from serena.mcp_workspaces import WorkspaceMode
 from serena.prompt_factory import SerenaPromptFactory
 from serena.util.cli_util import AutoRegisteringGroup
 from serena.util.logging import MemoryLogHandler
@@ -237,6 +238,13 @@ class TopLevelCommands(AutoRegisteringGroup):
         "--context", type=str, default=DEFAULT_CONTEXT, show_default=True, help="Built-in context name or path to custom context YAML."
     )
     @click.option(
+        "--workspace-mode",
+        type=click.Choice([mode.value for mode in WorkspaceMode]),
+        default=WorkspaceMode.SINGLE.value,
+        show_default=True,
+        help="Project routing: single uses only --project; multi exposes isolated workspaces for parallel chats.",
+    )
+    @click.option(
         "--mode",
         "default_modes",
         type=str,
@@ -319,6 +327,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         project_file_arg: str | None,
         project_from_cwd: bool | None,
         context: str,
+        workspace_mode: str,
         default_modes: Sequence[str],
         added_modes: Sequence[str],
         language_backend: str | None,
@@ -366,11 +375,24 @@ class TopLevelCommands(AutoRegisteringGroup):
 
         project_file = project_file_arg or project
 
+        # validate explicit project-routing mode
+        parsed_workspace_mode = WorkspaceMode(workspace_mode)
+        if parsed_workspace_mode.is_multi and project_file is not None:
+            raise click.UsageError("--workspace-mode multi cannot be used with --project; each chat opens its own workspace")
+        if context == "chatgpt" and not parsed_workspace_mode.is_multi and project_file is None:
+            raise click.UsageError("--workspace-mode single with --context chatgpt requires --project")
+
         mode_selection_def: ModeSelectionDefinition | None = None
         if default_modes or added_modes:
             mode_selection_def = ModeSelectionDefinitionWithAddedModes(default_modes=default_modes or None, added_modes=added_modes or None)
 
-        factory = SerenaMCPFactory(transport=transport, context=context, project=project_file, memory_log_handler=memory_log_handler)
+        factory = SerenaMCPFactory(
+            transport=transport,
+            context=context,
+            project=project_file,
+            memory_log_handler=memory_log_handler,
+            workspace_mode=parsed_workspace_mode,
+        )
         server = factory.create_mcp_server(
             host=host,
             port=port,
