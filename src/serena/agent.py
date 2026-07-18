@@ -67,6 +67,8 @@ from solidlsp.util.subprocess_util import terminate_process_tree_with_kill_fallb
 
 if TYPE_CHECKING:
     from serena.gui_log_viewer import GuiLogViewer
+    from serena.mcp_workspaces import WorkspaceRegistry
+    from serena.tools.cmd_tools import TerminalProcessManager
 
 log = logging.getLogger(__name__)
 TTool = TypeVar("TTool", bound="Tool")
@@ -545,6 +547,8 @@ class SerenaAgent:
         context: SerenaAgentContext | None = None,
         modes: ModeSelectionDefinition | None = None,
         memory_log_handler: MemoryLogHandler | None = None,
+        workspace_id: str | None = None,
+        workspace_registry: "WorkspaceRegistry | None" = None,
     ):
         """
         :param project: the project to load immediately or None to not load any project; may be a path to the project or a name of
@@ -556,8 +560,15 @@ class SerenaAgent:
         :param modes: mode selection definition to apply for this session
         :param memory_log_handler: a MemoryLogHandler instance from which to read log messages; if None, a new one will be created
             if necessary.
+        :param workspace_id: explicit shared-MCP workspace identifier, or None for the legacy global agent.
+        :param workspace_registry: shared-MCP workspace registry available to workspace-management tools.
         """
+        from serena.tools.cmd_tools import TerminalProcessManager
+
         self._active_project: Project | None = None
+        self._workspace_id = workspace_id
+        self._workspace_registry = workspace_registry
+        self._terminal_process_manager = TerminalProcessManager()
         self._project_activation_callback = project_activation_callback
         self._gui_log_viewer: Optional["GuiLogViewer"] = None
         self._dashboard_manager: DashboardManager | None = None
@@ -849,6 +860,24 @@ class SerenaAgent:
 
     def get_context(self) -> SerenaAgentContext:
         return self._context
+
+    def get_workspace_id(self) -> str | None:
+        """Return the explicit shared-MCP workspace identifier for this agent."""
+        return self._workspace_id
+
+    def set_workspace_registry(self, workspace_registry: "WorkspaceRegistry") -> None:
+        """Attach the shared-MCP workspace registry used by management tools."""
+        self._workspace_registry = workspace_registry
+
+    def get_workspace_registry_or_raise(self) -> "WorkspaceRegistry":
+        """Return the shared-MCP workspace registry or raise outside that server mode."""
+        if self._workspace_registry is None:
+            raise ValueError("Workspace management is not enabled for this Serena server")
+        return self._workspace_registry
+
+    def get_terminal_process_manager(self) -> "TerminalProcessManager":
+        """Return this agent's isolated terminal session manager."""
+        return self._terminal_process_manager
 
     def get_tool_description_override(self, tool_name: str) -> str | None:
         return self._context.tool_description_overrides.get(tool_name, None)
@@ -1418,6 +1447,9 @@ class SerenaAgent:
         Shutdown handler of the agent, freeing resources and stopping background tasks.
         """
         log.info("SerenaAgent is shutting down ...")
+        terminal_process_manager = getattr(self, "_terminal_process_manager", None)
+        if terminal_process_manager is not None:
+            terminal_process_manager.shutdown()
         if self._active_project is not None:
             log.info(f"Shutting down active project '{self._active_project.project_name}' ...")
             self._active_project.shutdown(timeout=timeout)

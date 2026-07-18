@@ -3,8 +3,9 @@ The Serena Model Context Protocol (MCP) Server
 """
 
 import sys
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -27,11 +28,15 @@ from serena.agent import (
 from serena.config.context_mode import SerenaAgentContext
 from serena.config.serena_config import LanguageBackend, ModeSelectionDefinition
 from serena.constants import DEFAULT_CONTEXT, SERENA_LOG_FORMAT
+from serena.mcp_workspaces import WorkspaceError, WorkspaceRegistry
 from serena.tools import Tool, ToolCallError
 from serena.util.exception import show_fatal_exception_safe
 from serena.util.logging import MemoryLogHandler
 
 log = logging.getLogger(__name__)
+
+_workspace_id_context: ContextVar[str | None] = ContextVar("serena_workspace_id", default=None)
+WORKSPACE_MANAGEMENT_TOOLS = {"open_workspace", "list_workspaces", "close_workspace"}
 
 
 def configure_logging(*args, **kwargs) -> None:
@@ -51,12 +56,21 @@ class SerenaMCPRequestContext:
 
 
 class SerenaFastMCPTool(FastMCPTool):
-    def __init__(self, tool: Tool, openai_tool_compatible: bool, structured_output: bool | None):
+    def __init__(
+        self,
+        tool: Tool,
+        openai_tool_compatible: bool,
+        structured_output: bool | None,
+        tool_resolver: Callable[[str | None, str], Tool] | None = None,
+        workspace_routing: bool = False,
+    ):
         """
         :param tool: the Serena tool
         :param openai_tool_compatible: whether to process the tool schema to be compatible with OpenAI tools
             (doesn't accept integer, needs number instead, etc.). This allows using Serena MCP within Codex.
         :param structured_output: whether to use structured output for the tool (None = auto)
+        :param tool_resolver: optional resolver for selecting a workspace-bound tool instance
+        :param workspace_routing: whether to expose and consume the optional workspace_id routing argument
         """
         func_name = tool.get_name()
         func_doc = tool.get_apply_docstring() or ""
@@ -105,11 +119,24 @@ class SerenaFastMCPTool(FastMCPTool):
             if (required := parameters.get("required")) and internal_name in required:
                 required[required.index(internal_name)] = public_name
 
+        if workspace_routing:
+            if "workspace_id" in parameters_properties:
+                raise ValueError(f"Cannot add workspace routing to tool {func_name!r}: workspace_id already exists")
+            parameters_properties["workspace_id"] = {
+                "type": "string",
+                "description": (
+                    "Workspace identifier returned by open_workspace. Omit only for backward-compatible global project behavior."
+                ),
+            }
+
         def execute_fn(**kwargs) -> str:
             try:
-                return tool.apply_ex(log_call=True, catch_exceptions=False, **kwargs)
+                resolved_tool = tool_resolver(_workspace_id_context.get(), func_name) if tool_resolver is not None else tool
+                return resolved_tool.apply_ex(log_call=True, catch_exceptions=False, **kwargs)
             except ToolCallError as e:
                 raise ToolError(e.get_error_message()) from e
+            except WorkspaceError as e:
+                raise ToolError(str(e)) from e
 
         # Generate human-readable title from snake_case tool name
         tool_title = " ".join(word.capitalize() for word in func_name.split("_"))
@@ -137,6 +164,7 @@ class SerenaFastMCPTool(FastMCPTool):
         )
 
         self._param_aliases = tool.get_param_aliases()
+        self._workspace_routing = workspace_routing
 
     async def run(
         self,
@@ -144,12 +172,18 @@ class SerenaFastMCPTool(FastMCPTool):
         context: Context[ServerSessionT, LifespanContextT, RequestT] | None = None,
         convert_result: bool = False,
     ) -> Any:
+        arguments = dict(arguments)
         # apply parameter aliases
         for param_alias, param_name in self._param_aliases.items():
             if param_alias in arguments and param_name not in arguments:
                 arguments[param_name] = arguments.pop(param_alias)
 
-        return await super().run(arguments, context, convert_result)
+        workspace_id = arguments.pop("workspace_id", None) if self._workspace_routing else None
+        token = _workspace_id_context.set(workspace_id)
+        try:
+            return await super().run(arguments, context, convert_result)
+        finally:
+            _workspace_id_context.reset(token)
 
 
 class SerenaMCPFactory:
@@ -177,6 +211,9 @@ class SerenaMCPFactory:
         self.project = project
         self.agent: SerenaAgent | None = None
         self.memory_log_handler = memory_log_handler
+        self._workspace_registry: WorkspaceRegistry | None = None
+        self._agent_config: SerenaConfig | None = None
+        self._mode_selection_def: ModeSelectionDefinition | None = None
 
     @staticmethod
     def _sanitize_for_openai_tools(schema: dict) -> dict:
@@ -286,7 +323,13 @@ class SerenaMCPFactory:
         return walk(s)
 
     @staticmethod
-    def make_mcp_tool(tool: Tool, openai_tool_compatible: bool = True, structured_output: bool | None = None) -> SerenaFastMCPTool:
+    def make_mcp_tool(
+        tool: Tool,
+        openai_tool_compatible: bool = True,
+        structured_output: bool | None = None,
+        tool_resolver: Callable[[str | None, str], Tool] | None = None,
+        workspace_routing: bool = False,
+    ) -> SerenaFastMCPTool:
         """
         Creates an MCP tool from a Serena Tool instance.
 
@@ -294,8 +337,24 @@ class SerenaMCPFactory:
         :param openai_tool_compatible: whether to process the tool schema to be compatible with OpenAI tools
             (doesn't accept integer, needs number instead, etc.). This allows using Serena MCP within codex.
         :param structured_output: whether to use structured output for the tool (None = auto)
+        :param tool_resolver: optional resolver for selecting a workspace-bound tool instance
+        :param workspace_routing: whether to expose the optional workspace_id routing argument
         """
-        return SerenaFastMCPTool(tool, openai_tool_compatible=openai_tool_compatible, structured_output=structured_output)
+        return SerenaFastMCPTool(
+            tool,
+            openai_tool_compatible=openai_tool_compatible,
+            structured_output=structured_output,
+            tool_resolver=tool_resolver,
+            workspace_routing=workspace_routing,
+        )
+
+    def _resolve_tool(self, workspace_id: str | None, tool_name: str) -> Tool:
+        assert self.agent is not None
+        if workspace_id is None:
+            return self.agent.get_tool_by_name(tool_name)
+        if self._workspace_registry is None:
+            raise WorkspaceError("Workspace management is not enabled for this Serena server")
+        return self._workspace_registry.get_agent(workspace_id).get_tool_by_name(tool_name)
 
     def _iter_tools(self) -> Iterator[Tool]:
         assert self.agent is not None
@@ -313,13 +372,36 @@ class SerenaMCPFactory:
         if mcp is not None:
             mcp._tool_manager._tools = {}
             for tool in self._iter_tools():
-                mcp_tool = self.make_mcp_tool(tool, openai_tool_compatible=openai_tool_compatible, structured_output=structured_output)
+                mcp_tool = self.make_mcp_tool(
+                    tool,
+                    openai_tool_compatible=openai_tool_compatible,
+                    structured_output=structured_output,
+                    tool_resolver=self._resolve_tool,
+                    workspace_routing=tool.get_name() not in WORKSPACE_MANAGEMENT_TOOLS,
+                )
                 mcp._tool_manager._tools[tool.get_name()] = mcp_tool
             log.info(f"Starting MCP server with {len(mcp._tool_manager._tools)} tools: {list(mcp._tool_manager._tools.keys())}")
 
     def _create_serena_agent(self, serena_config: SerenaConfig, modes: ModeSelectionDefinition | None = None) -> SerenaAgent:
         return SerenaAgent(
             project=self.project, serena_config=serena_config, context=self.context, modes=modes, memory_log_handler=self.memory_log_handler
+        )
+
+    def _create_workspace_agent(self, project: str, workspace_id: str) -> SerenaAgent:
+        if self._agent_config is None or self._workspace_registry is None:
+            raise WorkspaceError("Workspace management is not initialized")
+        config = deepcopy(self._agent_config)
+        config.web_dashboard = False
+        config.gui_log_window = False
+        config.web_dashboard_open_on_launch = False
+        return SerenaAgent(
+            project=project,
+            serena_config=config,
+            context=self.context,
+            modes=self._mode_selection_def,
+            memory_log_handler=self.memory_log_handler,
+            workspace_id=workspace_id,
+            workspace_registry=self._workspace_registry,
         )
 
     def _create_default_serena_config(self) -> SerenaConfig:
@@ -375,7 +457,11 @@ class SerenaMCPFactory:
             if language_backend is not None:
                 config.language_backend = language_backend
 
+            self._agent_config = deepcopy(config)
+            self._mode_selection_def = mode_selection_def
             self.agent = self._create_serena_agent(config, mode_selection_def)
+            self._workspace_registry = WorkspaceRegistry(self._create_workspace_agent)
+            self.agent.set_workspace_registry(self._workspace_registry)
 
         except Exception as e:
             show_fatal_exception_safe(e)
@@ -420,6 +506,8 @@ class SerenaMCPFactory:
                 log.info("MCP server shutting down")
                 if self.agent is not None:
                     self.agent.on_shutdown()
+                if self._workspace_registry is not None:
+                    self._workspace_registry.shutdown()
             else:
                 log.info("Client disconnected")
 

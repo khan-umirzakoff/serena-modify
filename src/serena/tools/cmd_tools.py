@@ -555,6 +555,14 @@ class TerminalProcessManager:
             self._sessions.pop(session_id, None)
         return True
 
+    def shutdown(self) -> None:
+        """Terminate and forget all terminal sessions owned by this manager."""
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            session.terminate()
+
 
 TERMINAL_PROCESS_MANAGER = TerminalProcessManager()
 
@@ -596,11 +604,14 @@ def _resolve_workdir(project_root: str, workdir: str | None) -> Path:
     return resolved
 
 
-def _load_expected_coding_git_root(project_root: Path) -> Path | None:
+def _load_expected_coding_git_root(project_root: Path, workspace_id: str | None = None) -> Path | None:
     """
     Return a fresh coding-task Git root recorded by ``prepare_coding_task``.
     """
-    context_path = project_root / ".serena" / "coding_task_context.json"
+    context_dir = project_root / ".serena"
+    if workspace_id is not None:
+        context_dir = context_dir / "task-sessions" / workspace_id
+    context_path = context_dir / "coding_task_context.json"
     if not context_path.is_file():
         return None
     try:
@@ -637,7 +648,7 @@ def _find_enclosing_git_root(path: Path) -> Path | None:
     return None
 
 
-def _terminal_context_warnings(project_root: Path, workdir: Path) -> list[str]:
+def _terminal_context_warnings(project_root: Path, workdir: Path, workspace_id: str | None = None) -> list[str]:
     """
     Return warnings for terminal context that differs from Serena's active project.
     """
@@ -658,7 +669,7 @@ def _terminal_context_warnings(project_root: Path, workdir: Path) -> list[str]:
     workdir_git_root = _find_enclosing_git_root(workdir)
     if workdir_git_root is not None and workdir_git_root.resolve() != project_root:
         resolved_workdir_git_root = workdir_git_root.resolve()
-        expected_git_root = _load_expected_coding_git_root(project_root)
+        expected_git_root = _load_expected_coding_git_root(project_root, workspace_id)
         if expected_git_root == resolved_workdir_git_root:
             warnings.append(
                 "Terminal workdir matches the latest prepare_coding_task nested Git root. "
@@ -676,11 +687,16 @@ def _terminal_context_warnings(project_root: Path, workdir: Path) -> list[str]:
     return warnings
 
 
-def _with_context_warnings(response: TerminalResponse, project_root: Path, workdir: Path) -> TerminalResponse:
+def _with_context_warnings(
+    response: TerminalResponse,
+    project_root: Path,
+    workdir: Path,
+    workspace_id: str | None = None,
+) -> TerminalResponse:
     """
     Return a terminal response annotated with project/workdir context warnings.
     """
-    warnings = [*response.warnings, *_terminal_context_warnings(project_root, workdir)]
+    warnings = [*response.warnings, *_terminal_context_warnings(project_root, workdir, workspace_id)]
     if not warnings:
         return response
     return replace(response, warnings=warnings)
@@ -716,8 +732,8 @@ class ExecuteShellCommandTool(Tool, ToolMarkerCanEdit):
         project_root = Path(self.get_project_root()).resolve()
         workdir = _resolve_workdir(str(project_root), cwd)
         yield_time_ms = MIN_YIELD_TIME_MS if background else _bounded(timeout_seconds * 1000, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
-        response = TERMINAL_PROCESS_MANAGER.exec_command(command=command, cwd=workdir, yield_time_ms=yield_time_ms)
-        response = _with_context_warnings(response, project_root, workdir)
+        response = self.agent.get_terminal_process_manager().exec_command(command=command, cwd=workdir, yield_time_ms=yield_time_ms)
+        response = _with_context_warnings(response, project_root, workdir, self.agent.get_workspace_id())
         return self._limit_length(_json_response(response), max_answer_chars)
 
 
@@ -750,7 +766,7 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
         """
         project_root = Path(self.get_project_root()).resolve()
         workdir_path = _resolve_workdir(str(project_root), workdir)
-        response = TERMINAL_PROCESS_MANAGER.exec_command(
+        response = self.agent.get_terminal_process_manager().exec_command(
             command=cmd,
             cwd=workdir_path,
             yield_time_ms=yield_time_ms,
@@ -759,7 +775,7 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
             login=login,
             tty=tty,
         )
-        response = _with_context_warnings(response, project_root, workdir_path)
+        response = _with_context_warnings(response, project_root, workdir_path, self.agent.get_workspace_id())
         return _json_response(response)
 
 
@@ -784,7 +800,7 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
         :param max_output_tokens: approximate output budget for this response. Defaults to 10000 tokens.
         :return: JSON terminal response with recent output, exit status, and continuing session ID if still running
         """
-        response = TERMINAL_PROCESS_MANAGER.write_stdin(
+        response = self.agent.get_terminal_process_manager().write_stdin(
             session_id=terminal_session_id,
             chars=chars,
             yield_time_ms=yield_time_ms,
@@ -812,7 +828,7 @@ class ListTerminalSessionsTool(Tool):
 
         :return: JSON list of running terminal sessions
         """
-        return json.dumps({"sessions": TERMINAL_PROCESS_MANAGER.list_sessions()}, ensure_ascii=False, indent=2)
+        return json.dumps({"sessions": self.agent.get_terminal_process_manager().list_sessions()}, ensure_ascii=False, indent=2)
 
 
 class TerminalStatusTool(Tool):
@@ -830,7 +846,7 @@ class TerminalStatusTool(Tool):
         :return: JSON terminal status
         """
         return json.dumps(
-            TERMINAL_PROCESS_MANAGER.session_status(
+            self.agent.get_terminal_process_manager().session_status(
                 terminal_session_id,
                 include_output=include_output,
                 max_output_tokens=max_output_tokens,
@@ -869,7 +885,7 @@ class SendTerminalSignalTool(Tool, ToolMarkerCanEdit):
         :param max_output_tokens: approximate output budget for this response
         :return: JSON terminal response with signal metadata
         """
-        sent_signal, response = TERMINAL_PROCESS_MANAGER.send_signal(
+        sent_signal, response = self.agent.get_terminal_process_manager().send_signal(
             terminal_session_id,
             signal_name=signal_name,
             yield_time_ms=yield_time_ms,
@@ -899,7 +915,7 @@ class StopTerminalSessionTool(Tool, ToolMarkerCanEdit):
         :param terminal_session_id: terminal session identifier returned as `session_id` by `exec_command`
         :return: JSON stop result
         """
-        stopped = TERMINAL_PROCESS_MANAGER.stop_session(terminal_session_id)
+        stopped = self.agent.get_terminal_process_manager().stop_session(terminal_session_id)
         return json.dumps({"session_id": terminal_session_id, "stopped": stopped}, ensure_ascii=False, indent=2)
 
     @classmethod

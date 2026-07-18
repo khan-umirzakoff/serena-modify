@@ -1,5 +1,7 @@
 """Tests for the mcp.py module in serena."""
 
+import asyncio
+
 import pytest
 from mcp.server.fastmcp.tools.base import Tool as MCPTool
 
@@ -79,6 +81,28 @@ def test_make_tool_execution() -> None:
     result = mcp_tool.fn(name="Alice", age=30)
 
     assert result == "Hello Alice, you are 30 years old!"
+
+
+def test_workspace_routing_schema_and_dispatch() -> None:
+    """Workspace-aware MCP tools expose the handle and resolve the matching tool instance."""
+    base_tool = BasicTool()
+    workspace_tool = BasicTool()
+    workspace_tool.apply_ex = lambda **kwargs: f"workspace:{kwargs['name']}"  # type: ignore[method-assign]
+    resolved: list[tuple[str | None, str]] = []
+
+    def resolver(workspace_id: str | None, tool_name: str) -> Tool:
+        resolved.append((workspace_id, tool_name))
+        return workspace_tool if workspace_id == "workspace-one" else base_tool
+
+    mcp_tool = make_tool(base_tool, tool_resolver=resolver, workspace_routing=True)
+
+    assert mcp_tool.parameters["properties"]["workspace_id"]["type"] == "string"
+    assert "workspace_id" not in mcp_tool.parameters.get("required", [])
+
+    result = asyncio.run(mcp_tool.run({"name": "Alice", "workspace_id": "workspace-one"}))
+
+    assert resolved == [("workspace-one", "basic")]
+    assert result == "workspace:Alice"
 
 
 def test_make_tool_no_params() -> None:
