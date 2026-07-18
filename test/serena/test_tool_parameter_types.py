@@ -25,6 +25,11 @@ def test_all_tool_parameters_have_type(context):
         mcp_tool = factory.make_mcp_tool(tool, openai_tool_compatible=True)
         params = mcp_tool.parameters
 
+        if tool.get_name() in {"write_stdin", "terminal_status", "send_terminal_signal", "stop_terminal_session"}:
+            assert "session_id" in params["properties"]
+            assert "terminal_session_id" not in params["properties"]
+            assert "session_id" in params["required"]
+
         # Collect any parameter that lacks a type
         issues = []
         print(f"Checking tool {tool}")

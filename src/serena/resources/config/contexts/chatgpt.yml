@@ -29,7 +29,7 @@ prompt: |
   textual multi-file patches, small atomic file changes, and dry-run patch validation. Preserve user changes,
   reject ambiguous edits, and avoid unrelated refactors.
   Use exec_command for shell work. Set tty=true for interactive programs, prompts, REPLs, and commands that
-  need stdin; plain pipe sessions are for non-interactive commands. Use write_stdin with terminal_session_id
+  need stdin; plain pipe sessions are for non-interactive commands. Use write_stdin with session_id
   to poll or interact with running sessions, including dev servers, watchers, tests, and REPL-like commands.
   Use list_terminal_sessions and stop_terminal_session to account for or clean up background processes. Keep
   output bounded and use returned log paths when full logs are needed. Do not leave long-running sessions unexplained.
@@ -57,6 +57,6 @@ tool_description_overrides:
   exec_command: |
     Codex-style terminal command runner. Use for shell commands with bounded output. Set tty=true for interactive programs, prompts, REPLs, and commands that need stdin.
   write_stdin: |
-    Continues a running exec_command terminal session. Pass terminal_session_id from exec_command's session_id. Use empty chars to poll; use non-empty chars to send input.
+    Continues a running exec_command terminal session. Pass session_id from exec_command. Use empty chars to poll; use non-empty chars to send input.
   apply_patch: |
     Applies Codex-style textual patches. Prefer for atomic multi-file textual edits and dry-run validation; use semantic tools for symbol-aware edits.

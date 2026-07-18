@@ -95,6 +95,16 @@ class SerenaFastMCPTool(FastMCPTool):
                 param_desc = f"{param_doc.description.strip().strip('.') + '.'}"
                 properties["description"] = param_desc[0].upper() + param_desc[1:]
 
+        # expose selected compatibility aliases as the canonical public schema names
+        for public_name, internal_name in tool.get_public_param_aliases().items():
+            if internal_name not in parameters_properties:
+                raise ValueError(f"Cannot expose unknown parameter alias target {internal_name!r} for tool {func_name!r}")
+            if public_name in parameters_properties:
+                raise ValueError(f"Cannot expose parameter alias {public_name!r} for tool {func_name!r}: name already exists")
+            parameters_properties[public_name] = parameters_properties.pop(internal_name)
+            if (required := parameters.get("required")) and internal_name in required:
+                required[required.index(internal_name)] = public_name
+
         def execute_fn(**kwargs) -> str:
             try:
                 return tool.apply_ex(log_call=True, catch_exceptions=False, **kwargs)

@@ -327,6 +327,14 @@ class Tool(Component):
         """
         return {}
 
+    @classmethod
+    def get_public_param_aliases(cls) -> dict[str, str]:
+        """
+        :return: aliases that should replace internal parameter names in the public MCP schema. The mapping uses the same
+            public-alias-to-internal-name direction as :meth:`get_param_aliases`.
+        """
+        return {}
+
     def apply_ex(self, log_call: bool = True, catch_exceptions: bool = True, mcp_ctx: Context | None = None, **kwargs) -> str:
         """
         Applies the tool with logging and exception handling, using the given keyword arguments.

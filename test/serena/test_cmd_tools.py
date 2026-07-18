@@ -4,8 +4,15 @@ from pathlib import Path
 
 import pytest
 
-from serena.tools.cmd_tools import TerminalProcessManager, _terminal_context_warnings
-from serena.tools.tools_base import ToolRegistry
+from serena.tools.cmd_tools import (
+    SendTerminalSignalTool,
+    StopTerminalSessionTool,
+    TerminalProcessManager,
+    TerminalStatusTool,
+    WriteStdinTool,
+    _terminal_context_warnings,
+)
+from serena.tools.tools_base import Tool, ToolRegistry
 
 
 def _python_command(source: str) -> str:
@@ -21,6 +28,18 @@ def test_exec_command_tool_and_write_stdin_tool_are_registered() -> None:
     assert "terminal_status" in names
     assert "send_terminal_signal" in names
     assert "stop_terminal_session" in names
+
+
+@pytest.mark.parametrize(
+    "tool_class",
+    (WriteStdinTool, TerminalStatusTool, SendTerminalSignalTool, StopTerminalSessionTool),
+)
+def test_terminal_continuation_tools_use_codex_session_id_with_legacy_alias(tool_class: type[Tool]) -> None:
+    metadata = tool_class.get_apply_fn_metadata_from_cls()
+
+    assert "terminal_session_id" in metadata.arg_model.model_json_schema()["properties"]
+    assert tool_class.get_param_aliases() == {"session_id": "terminal_session_id"}
+    assert tool_class.get_public_param_aliases() == {"session_id": "terminal_session_id"}
 
 
 def test_terminal_context_warns_for_nested_repo(tmp_path: Path) -> None:

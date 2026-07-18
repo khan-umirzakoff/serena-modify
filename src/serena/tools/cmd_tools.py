@@ -792,6 +792,14 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
         )
         return _json_response(response)
 
+    @classmethod
+    def get_param_aliases(cls) -> dict[str, str]:
+        return {"session_id": "terminal_session_id"}
+
+    @classmethod
+    def get_public_param_aliases(cls) -> dict[str, str]:
+        return cls.get_param_aliases()
+
 
 class ListTerminalSessionsTool(Tool):
     """
@@ -831,6 +839,14 @@ class TerminalStatusTool(Tool):
             indent=2,
         )
 
+    @classmethod
+    def get_param_aliases(cls) -> dict[str, str]:
+        return {"session_id": "terminal_session_id"}
+
+    @classmethod
+    def get_public_param_aliases(cls) -> dict[str, str]:
+        return cls.get_param_aliases()
+
 
 class SendTerminalSignalTool(Tool, ToolMarkerCanEdit):
     """
@@ -862,6 +878,14 @@ class SendTerminalSignalTool(Tool, ToolMarkerCanEdit):
         payload = json.loads(_json_response(response))
         return json.dumps({"signal": sent_signal, **payload}, ensure_ascii=False, indent=2)
 
+    @classmethod
+    def get_param_aliases(cls) -> dict[str, str]:
+        return {"session_id": "terminal_session_id"}
+
+    @classmethod
+    def get_public_param_aliases(cls) -> dict[str, str]:
+        return cls.get_param_aliases()
+
 
 class StopTerminalSessionTool(Tool, ToolMarkerCanEdit):
     """
@@ -877,3 +901,11 @@ class StopTerminalSessionTool(Tool, ToolMarkerCanEdit):
         """
         stopped = TERMINAL_PROCESS_MANAGER.stop_session(terminal_session_id)
         return json.dumps({"session_id": terminal_session_id, "stopped": stopped}, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def get_param_aliases(cls) -> dict[str, str]:
+        return {"session_id": "terminal_session_id"}
+
+    @classmethod
+    def get_public_param_aliases(cls) -> dict[str, str]:
+        return cls.get_param_aliases()
