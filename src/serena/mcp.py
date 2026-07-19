@@ -43,10 +43,6 @@ open_workspace with the relevant project path or registered project name. Keep t
 to that chat and pass it to every subsequent Serena tool call. Never reuse another chat's workspace_id. If it
 expires, call open_workspace again. Call close_workspace when the task is finished and the workspace is no longer needed.
 """.strip()
-SINGLE_WORKSPACE_INSTRUCTIONS = """
-This server is running in single-workspace mode. Work directly in the active startup project. Workspace selection
-and workspace_id routing are intentionally disabled, so do not ask the user to select or open a workspace.
-""".strip()
 
 
 def configure_logging(*args, **kwargs) -> None:
@@ -541,6 +537,4 @@ class SerenaMCPFactory:
         instructions = self.agent.create_connection_prompt()
         if self.workspace_mode.is_multi:
             return f"{instructions}\n\n{MULTI_WORKSPACE_INSTRUCTIONS}"
-        if self.project is not None:
-            return f"{instructions}\n\n{SINGLE_WORKSPACE_INSTRUCTIONS}"
         return instructions

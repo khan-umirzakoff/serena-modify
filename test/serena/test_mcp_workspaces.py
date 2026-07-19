@@ -56,7 +56,7 @@ def test_workspace_tools_are_exposed_only_in_multi_mode() -> None:
 
 
 def test_mcp_schema_matches_workspace_mode() -> None:
-    observed: dict[str, tuple[bool, bool]] = {}
+    observed: dict[str, tuple[bool, bool, bool]] = {}
 
     for workspace_mode in WorkspaceMode:
         factory = SerenaMCPFactory(transport="stdio", context="chatgpt", workspace_mode=workspace_mode)
@@ -71,14 +71,15 @@ def test_mcp_schema_matches_workspace_mode() -> None:
         observed[workspace_mode.value] = (
             "open_workspace" in tools,
             "workspace_id" in tools["read_file"].parameters["properties"],
+            "open_workspace" in factory._get_initial_instructions(),
         )
         if factory._workspace_registry is not None:
             factory._workspace_registry.shutdown()
         factory.agent.on_shutdown()
 
     assert observed == {
-        "single": (False, False),
-        "multi": (True, True),
+        "single": (False, False, False),
+        "multi": (True, True, True),
     }
 
 
