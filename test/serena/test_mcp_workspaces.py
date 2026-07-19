@@ -83,6 +83,36 @@ def test_mcp_schema_matches_workspace_mode() -> None:
     }
 
 
+def test_chatgpt_harness_ux_is_remote_and_unambiguous() -> None:
+    factory = SerenaMCPFactory(
+        transport="stdio",
+        context="chatgpt",
+        workspace_mode=WorkspaceMode.SINGLE,
+    )
+    server = factory.create_mcp_server(
+        enable_web_dashboard=False,
+        enable_gui_log_window=False,
+        open_web_dashboard=False,
+    )
+    assert factory.agent is not None
+    factory._set_mcp_tools(server, openai_tool_compatible=True, structured_output=False)
+
+    tools = server._tool_manager._tools
+    system_prompt = factory.agent.create_system_prompt()
+
+    assert "execute_shell_command" not in tools
+    assert "remote MCP coding harness" in system_prompt
+    assert "output_mode" in system_prompt
+    assert "submit=true" in system_prompt
+    assert "desktop app context" not in system_prompt
+    assert "separate code editor window" not in system_prompt
+    assert "output_mode" in tools["exec_command"].description
+    assert "submit" in tools["write_stdin"].parameters["properties"]
+    assert "Enter" in tools["write_stdin"].parameters["properties"]["submit"]["description"]
+
+    factory.agent.on_shutdown()
+
+
 def test_workspace_registry_isolates_agents_and_closes_resources(tmp_path: Path) -> None:
     agents: dict[str, FakeAgent] = {}
 

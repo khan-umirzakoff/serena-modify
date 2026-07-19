@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from serena.tools import Tool, ToolMarkerCanEdit
 from serena.tools.terminal_screen import TerminalDimensions, TerminalScreen, TerminalScreenSnapshot
@@ -175,13 +175,7 @@ class TerminalResponse:
     omitted_bytes: int
     log_path: str
     transport: str
-    rendered_screen: str | None = None
-    cursor_row: int | None = None
-    cursor_column: int | None = None
-    terminal_rows: int | None = None
-    terminal_columns: int | None = None
-    synchronized_output: bool = False
-    bracketed_paste: bool = False
+    output_mode: Literal["stream", "screen"]
     timed_out: bool = False
     pty_requested_but_pipe_used: bool = False
     warnings: list[str] = field(default_factory=list)
@@ -363,13 +357,7 @@ class TerminalSession:
             omitted_bytes=omitted,
             log_path=str(self.log_path),
             transport=self.transport,
-            rendered_screen=output if screen_snapshot is not None else None,
-            cursor_row=screen_snapshot.cursor_row if screen_snapshot is not None else None,
-            cursor_column=screen_snapshot.cursor_column if screen_snapshot is not None else None,
-            terminal_rows=screen_snapshot.dimensions.rows if screen_snapshot is not None else None,
-            terminal_columns=screen_snapshot.dimensions.columns if screen_snapshot is not None else None,
-            synchronized_output=screen_snapshot.synchronized_output if screen_snapshot is not None else False,
-            bracketed_paste=screen_snapshot.bracketed_paste if screen_snapshot is not None else False,
+            output_mode="screen" if screen_snapshot is not None else "stream",
             timed_out=timed_out and running,
             pty_requested_but_pipe_used=False,
         )
@@ -410,22 +398,7 @@ class TerminalSession:
             "duration_ms": int((time.monotonic() - self.started_at) * 1000),
             "last_used_age_ms": int((time.monotonic() - self.last_used) * 1000),
             "log_path": str(self.log_path),
-            **self._screen_info(),
-        }
-
-    def _screen_info(self) -> dict[str, object]:
-        """Describe the latest rendered terminal state."""
-        if self.terminal_screen is None:
-            return {}
-
-        snapshot = self.terminal_screen.snapshot()
-        return {
-            "cursor_row": snapshot.cursor_row,
-            "cursor_column": snapshot.cursor_column,
-            "terminal_rows": snapshot.dimensions.rows,
-            "terminal_columns": snapshot.dimensions.columns,
-            "synchronized_output": snapshot.synchronized_output,
-            "bracketed_paste": snapshot.bracketed_paste,
+            "output_mode": "screen" if self.terminal_screen is not None else "stream",
         }
 
     def status(self, include_output: bool = False, max_output_tokens: int | None = None) -> dict[str, object]:
@@ -450,7 +423,6 @@ class TerminalSession:
             status.update(
                 {
                     "output": output,
-                    "rendered_screen": output if screen_snapshot is not None else None,
                     "original_token_count": _approx_token_count(output),
                     "omitted_bytes": omitted,
                 }
@@ -692,26 +664,25 @@ TERMINAL_PROCESS_MANAGER = TerminalProcessManager()
 
 def _json_response(response: TerminalResponse) -> str:
     payload = asdict(response)
-    # Keep Codex's trained output field names first while retaining Serena diagnostics.
-    ordered = {
-        "chunk_id": payload["chunk_id"],
-        "wall_time_seconds": payload["wall_time_seconds"],
-        "exit_code": payload["exit_code"],
-        "session_id": payload["session_id"],
-        "original_token_count": payload["original_token_count"],
+    ordered: dict[str, object] = {
         "output": payload["output"],
-        "warnings": payload["warnings"],
-        "command": payload["command"],
-        "cwd": payload["cwd"],
-        "pid": payload["pid"],
+        "output_mode": payload["output_mode"],
+        "session_id": payload["session_id"],
         "running": payload["running"],
-        "duration_ms": payload["duration_ms"],
-        "omitted_bytes": payload["omitted_bytes"],
+        "exit_code": payload["exit_code"],
+        "wall_time_seconds": payload["wall_time_seconds"],
         "log_path": payload["log_path"],
-        "transport": payload["transport"],
-        "timed_out": payload["timed_out"],
-        "pty_requested_but_pipe_used": payload["pty_requested_but_pipe_used"],
     }
+
+    if payload["omitted_bytes"]:
+        ordered["omitted_bytes"] = payload["omitted_bytes"]
+    if payload["timed_out"]:
+        ordered["timed_out"] = True
+    if payload["pty_requested_but_pipe_used"]:
+        ordered["pty_requested_but_pipe_used"] = True
+    if payload["warnings"]:
+        ordered["warnings"] = payload["warnings"]
+
     return json.dumps(ordered, ensure_ascii=False, indent=2)
 
 
@@ -880,6 +851,8 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
         """
         Run a shell command with Codex-style bounded output and session handling.
 
+        For PTY sessions, set rows and columns only when the default 80x24 screen is unsuitable.
+
         :param cmd: shell command to execute
         :param workdir: working directory for the command. Relative paths resolve inside the active project root.
         :param yield_time_ms: wait before yielding output. Defaults to 10000 ms and is capped to 250-30000 ms.
@@ -889,7 +862,7 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
         :param tty: request a rendered xterm-compatible PTY for interactive commands, prompts, REPLs, and TUI applications.
         :param rows: initial PTY height in rows. Defaults to 24 and applies only when tty=true.
         :param columns: initial PTY width in columns. Defaults to 80 and applies only when tty=true.
-        :return: JSON terminal response. PTY responses include a stable rendered_screen; raw PTY bytes remain in log_path.
+        :return: JSON terminal response. output_mode is stream for pipes and screen for stable rendered PTY snapshots; raw bytes remain in log_path.
         """
         project_root = Path(self.get_project_root()).resolve()
         workdir_path = _resolve_workdir(str(project_root), workdir)
@@ -926,6 +899,8 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
         """
         Write characters to an existing terminal session and return recent bounded output.
 
+        Set submit=true to send chars and Enter together. Set rows or columns only when resizing a PTY.
+
         :param terminal_session_id: terminal session identifier returned as `session_id` by `exec_command`
         :param chars: characters to write to stdin. Empty string polls unless submit=true.
         :param yield_time_ms: wait before yielding output. Non-empty writes default to 250 ms; empty polls default to 5000 ms.
@@ -933,7 +908,7 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
         :param submit: append Enter to chars in the same prepared input write. Uses bracketed paste when the application enables it.
         :param rows: resize the PTY to this height before writing or polling.
         :param columns: resize the PTY to this width before writing or polling.
-        :return: JSON terminal response with the latest complete rendered_screen, exit status, and session ID if still running
+        :return: JSON terminal response. In screen mode, output is the latest complete rendered frame rather than raw ANSI bytes.
         """
         response = self.agent.get_terminal_process_manager().write_stdin(
             session_id=terminal_session_id,

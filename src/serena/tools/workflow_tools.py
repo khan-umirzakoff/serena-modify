@@ -1556,7 +1556,6 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "send_terminal_signal",
                 "list_terminal_sessions",
                 "stop_terminal_session",
-                "execute_shell_command",
             ],
             "workflow_tools": [
                 "update_plan",
