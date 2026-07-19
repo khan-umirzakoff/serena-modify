@@ -72,6 +72,14 @@ class CodingTaskSnapshot:
     git_diff_cached_stat: CommandSnapshot
 
 
+@dataclass(frozen=True)
+class ProjectSwitchGuidance:
+    """Exact project activation and retry arguments for an out-of-project focus path."""
+
+    project: str
+    relative_path: str
+
+
 GOAL_STATE_FILENAME = "goal_state.json"
 PLAN_STATE_FILENAME = "plan_state.json"
 CODING_TASK_CONTEXT_FILENAME = "coding_task_context.json"
@@ -511,6 +519,60 @@ def _resolve_focus_dir(project_root: Path, relative_path: str) -> Path:
     if not focus_path.exists() and focus_path.suffix:
         return focus_path.parent
     return focus_path
+
+
+def _project_switch_guidance(project_root: Path, relative_path: str) -> ProjectSwitchGuidance:
+    """Resolve a likely project root and task-relative retry path for an external focus path."""
+    requested_path = (project_root / relative_path).resolve()
+    candidate = requested_path
+    if requested_path.is_file() or (not requested_path.exists() and requested_path.suffix):
+        candidate = requested_path.parent
+
+    switch_root = candidate
+    if candidate.is_dir():
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=candidate,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            result = None
+        if result is not None and result.returncode == 0 and result.stdout.strip():
+            git_root = Path(result.stdout.strip()).resolve()
+            if requested_path == git_root or git_root in requested_path.parents:
+                switch_root = git_root
+
+    try:
+        retry_path = requested_path.relative_to(switch_root).as_posix() or "."
+    except ValueError:
+        retry_path = "."
+    return ProjectSwitchGuidance(project=str(switch_root), relative_path=retry_path)
+
+
+def _resolve_coding_task_focus_dir(
+    project_root: Path,
+    relative_path: str,
+    *,
+    activate_project_available: bool,
+    workspace_id: str | None,
+) -> Path:
+    """Resolve coding-task focus and provide an actionable project-switch error when possible."""
+    try:
+        return _resolve_focus_dir(project_root, relative_path)
+    except ValueError as error:
+        if not activate_project_available:
+            raise
+        guidance = _project_switch_guidance(project_root, relative_path)
+        workspace_argument = f', workspace_id="{workspace_id}"' if workspace_id is not None else ""
+        raise ValueError(
+            f"Focus path is outside the active project: {(project_root / relative_path).resolve()}.\n"
+            f'Call activate_project(project="{guidance.project}"{workspace_argument}), then '
+            f'prepare_coding_task(relative_path="{guidance.relative_path}"{workspace_argument}).'
+        ) from error
 
 
 def _instruction_search_dirs(project_root: Path, focus_dir: Path) -> list[Path]:
@@ -1402,7 +1464,12 @@ class PrepareCodingTaskTool(Tool):
         project_root = Path(active_project.project_root).resolve()
         workspace_id = self.agent.get_workspace_id()
 
-        focus_dir = _resolve_focus_dir(project_root, relative_path)
+        focus_dir = _resolve_coding_task_focus_dir(
+            project_root,
+            relative_path,
+            activate_project_available=self.agent.tool_is_exposed("activate_project"),
+            workspace_id=workspace_id,
+        )
         focus_path = _relative_path(focus_dir, project_root)
         instruction_settings = _project_instruction_settings()
         instruction_budget = instruction_settings.max_bytes if max_instruction_bytes is None else max_instruction_bytes

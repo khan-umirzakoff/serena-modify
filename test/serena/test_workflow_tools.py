@@ -20,6 +20,8 @@ from serena.tools.workflow_tools import (
     _normalize_validation_id,
     _parse_validation_diagnostics,
     _project_instruction_settings,
+    _project_switch_guidance,
+    _resolve_coding_task_focus_dir,
     _resolve_focus_dir,
     _resolve_git_root,
     _resolve_review_target,
@@ -136,6 +138,58 @@ def test_resolve_focus_dir_rejects_paths_outside_project(tmp_path: Path) -> None
         assert "inside the active project" in str(e)
     else:
         raise AssertionError("Expected focus path outside the project to be rejected")
+
+
+def test_project_switch_guidance_targets_external_directory(tmp_path: Path) -> None:
+    active_project = tmp_path / "active"
+    target_project = tmp_path / "target"
+    active_project.mkdir()
+    target_project.mkdir()
+
+    guidance = _project_switch_guidance(active_project, str(target_project))
+
+    assert guidance.project == str(target_project)
+    assert guidance.relative_path == "."
+
+
+def test_coding_task_focus_error_guides_available_project_switch(tmp_path: Path) -> None:
+    active_project = tmp_path / "active"
+    target_project = tmp_path / "target"
+    active_project.mkdir()
+    target_project.mkdir()
+
+    try:
+        _resolve_coding_task_focus_dir(
+            active_project,
+            str(target_project),
+            activate_project_available=True,
+            workspace_id=None,
+        )
+    except ValueError as error:
+        message = str(error)
+        assert f'activate_project(project="{target_project}")' in message
+        assert 'prepare_coding_task(relative_path=".")' in message
+    else:
+        raise AssertionError("Expected external coding-task focus to provide project-switch guidance")
+
+
+def test_coding_task_focus_error_stays_strict_without_project_switching(tmp_path: Path) -> None:
+    active_project = tmp_path / "active"
+    target_project = tmp_path / "target"
+    active_project.mkdir()
+    target_project.mkdir()
+
+    try:
+        _resolve_coding_task_focus_dir(
+            active_project,
+            str(target_project),
+            activate_project_available=False,
+            workspace_id=None,
+        )
+    except ValueError as error:
+        assert str(error) == f"Focus path must stay inside the active project: {target_project}"
+    else:
+        raise AssertionError("Expected external coding-task focus to remain blocked")
 
 
 def test_infer_validation_hints_detects_python_and_node_commands(tmp_path: Path) -> None:
