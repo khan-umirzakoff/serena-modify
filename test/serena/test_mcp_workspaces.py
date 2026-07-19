@@ -103,12 +103,16 @@ def test_chatgpt_harness_ux_is_remote_and_unambiguous() -> None:
     assert "execute_shell_command" not in tools
     assert "remote MCP coding harness" in system_prompt
     assert "output_mode" in system_prompt
-    assert "submit=true" in system_prompt
+    assert 'keys=["ENTER"]' in system_prompt
     assert "desktop app context" not in system_prompt
     assert "separate code editor window" not in system_prompt
     assert "output_mode" in tools["exec_command"].description
-    assert "submit" in tools["write_stdin"].parameters["properties"]
-    assert "Enter" in tools["write_stdin"].parameters["properties"]["submit"]["description"]
+    write_properties = tools["write_stdin"].parameters["properties"]
+    assert "keys" in write_properties
+    assert "submit" not in write_properties
+    assert write_properties["keys"]["items"]["$ref"] == "#/$defs/TerminalKey"
+    assert "ENTER" in tools["write_stdin"].parameters["$defs"]["TerminalKey"]["enum"]
+    assert "semantic terminal keys" in write_properties["keys"]["description"].lower()
 
     factory.agent.on_shutdown()
 

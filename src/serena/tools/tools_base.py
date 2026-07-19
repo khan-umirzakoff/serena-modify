@@ -335,6 +335,13 @@ class Tool(Component):
         """
         return {}
 
+    @classmethod
+    def get_hidden_mcp_params(cls) -> set[str]:
+        """
+        :return: internal compatibility parameters omitted from the public MCP schema.
+        """
+        return set()
+
     def apply_ex(self, log_call: bool = True, catch_exceptions: bool = True, mcp_ctx: Context | None = None, **kwargs) -> str:
         """
         Applies the tool with logging and exception handling, using the given keyword arguments.

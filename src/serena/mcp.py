@@ -125,6 +125,14 @@ class SerenaFastMCPTool(FastMCPTool):
             if (required := parameters.get("required")) and internal_name in required:
                 required[required.index(internal_name)] = public_name
 
+        # hide compatibility-only parameters while retaining them in runtime validation
+        for hidden_name in tool.get_hidden_mcp_params():
+            if hidden_name not in parameters_properties:
+                raise ValueError(f"Cannot hide unknown MCP parameter {hidden_name!r} for tool {func_name!r}")
+            parameters_properties.pop(hidden_name)
+            if (required := parameters.get("required")) and hidden_name in required:
+                required.remove(hidden_name)
+
         if workspace_routing:
             if "workspace_id" in parameters_properties:
                 raise ValueError(f"Cannot add workspace routing to tool {func_name!r}: workspace_id already exists")
@@ -284,15 +292,16 @@ class SerenaMCPFactory:
             # ---- simplify anyOf/oneOf if they only differ by integer/number ----
             for key in ("oneOf", "anyOf"):
                 if key in node and isinstance(node[key], list):
-                    # Special case: anyOf or oneOf with "type X" and "null"
+                    # simplify a nullable schema without discarding constraints
                     if len(node[key]) == 2:
-                        types = [sub.get("type") for sub in node[key]]
-                        if "null" in types:
-                            non_null_type = next(t for t in types if t != "null")
-                            if isinstance(non_null_type, str):
-                                node["type"] = non_null_type
-                                node.pop(key, None)
-                                continue
+                        null_schemas = [sub for sub in node[key] if sub.get("type") == "null"]
+                        non_null_schemas = [sub for sub in node[key] if sub.get("type") != "null"]
+                        if len(null_schemas) == 1 and len(non_null_schemas) == 1:
+                            non_null_schema = walk(non_null_schemas[0])
+                            node.pop(key, None)
+                            for schema_key, schema_value in non_null_schema.items():
+                                node.setdefault(schema_key, schema_value)
+                            continue
                     simplified = []
                     changed = False
                     for sub in node[key]:

@@ -1523,7 +1523,8 @@ class GetCodingHarnessInstructionsTool(Tool):
                 "terminal": (
                     "Use exec_command for commands; set tty=true for interactive stdin/REPL/prompt workflows. "
                     "Use write_stdin for stdin, terminal_status for non-consuming status checks, "
-                    "and send_terminal_signal for SIGINT/SIGTERM/SIGKILL instead of raw control-character hacks."
+                    "and send_terminal_signal for SIGINT/SIGTERM/SIGKILL instead of raw control-character hacks. "
+                    "Keep write_stdin chars literal and use semantic keys such as ENTER for terminal actions."
                 ),
                 "flow": "Inspect → plan when useful → edit minimally → validate focused → inspect failures → fix task-related issues → finalize.",
                 "output": "Keep command output bounded; use log_path for full logs.",

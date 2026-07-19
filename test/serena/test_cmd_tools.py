@@ -15,6 +15,7 @@ from serena.tools.cmd_tools import (
     _json_response,
     _terminal_context_warnings,
 )
+from serena.tools.terminal_screen import TerminalKey
 from serena.tools.tools_base import Tool, ToolRegistry
 
 
@@ -145,19 +146,55 @@ def test_write_stdin_sends_input_to_process(tmp_path: Path) -> None:
     assert "echo:hello" in second.output
 
 
-def test_write_stdin_submits_text_with_enter(tmp_path: Path) -> None:
+def test_write_stdin_sends_text_and_semantic_enter_together(tmp_path: Path) -> None:
     manager = TerminalProcessManager()
     command = _python_command("import sys; line = sys.stdin.readline(); print('submitted:' + line.strip(), flush=True)")
 
     first = manager.exec_command(command, cwd=tmp_path, yield_time_ms=250, tty=True)
     assert first.session_id is not None
 
-    second = manager.write_stdin(first.session_id, chars="atomic task", submit=True, yield_time_ms=1000)
+    second = manager.write_stdin(first.session_id, chars="atomic task", keys=[TerminalKey.ENTER], yield_time_ms=1000)
 
     assert second.running is False
     assert second.exit_code == 0
     assert "submitted:atomic task" in second.output
     assert second.output_mode == "screen"
+
+
+def test_write_stdin_keeps_legacy_submit_compatibility(tmp_path: Path) -> None:
+    manager = TerminalProcessManager()
+    command = _python_command("import sys; line = sys.stdin.readline(); print('legacy:' + line.strip(), flush=True)")
+
+    first = manager.exec_command(command, cwd=tmp_path, yield_time_ms=250, tty=True)
+    assert first.session_id is not None
+
+    second = manager.write_stdin(first.session_id, chars="old client", submit=True, yield_time_ms=1000)
+
+    assert second.exit_code == 0
+    assert "legacy:old client" in second.output
+
+
+def test_write_stdin_encodes_generic_tui_keys_after_literal_text(tmp_path: Path) -> None:
+    manager = TerminalProcessManager()
+    command = _python_command(
+        "import os, sys, tty; "
+        "fd = sys.stdin.fileno(); tty.setraw(fd); os.write(1, b'READY'); "
+        "data = os.read(fd, 6); os.write(1, b' HEX:' + data.hex().encode())"
+    )
+
+    first = manager.exec_command(command, cwd=tmp_path, yield_time_ms=250, tty=True)
+    assert first.session_id is not None
+    assert "READY" in first.output
+
+    second = manager.write_stdin(
+        first.session_id,
+        chars="ab",
+        keys=[TerminalKey.DOWN, TerminalKey.ENTER],
+        yield_time_ms=1000,
+    )
+
+    assert second.exit_code == 0
+    assert "HEX:61621b5b420d" in second.output
 
 
 def test_pty_response_renders_ansi_instead_of_returning_raw_sequences(tmp_path: Path) -> None:
@@ -226,7 +263,7 @@ def test_pty_initial_size_and_resize_are_reported_to_process(tmp_path: Path) -> 
     assert first.session_id is not None
     assert "initial:100x30" in first.output
 
-    second = manager.write_stdin(first.session_id, submit=True, rows=40, columns=120, yield_time_ms=1000)
+    second = manager.write_stdin(first.session_id, keys=[TerminalKey.ENTER], rows=40, columns=120, yield_time_ms=1000)
 
     assert second.exit_code == 0
     assert "resized:120x40" in second.output

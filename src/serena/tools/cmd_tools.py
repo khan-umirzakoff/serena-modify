@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from serena.tools import Tool, ToolMarkerCanEdit
-from serena.tools.terminal_screen import TerminalDimensions, TerminalScreen, TerminalScreenSnapshot
+from serena.tools.terminal_screen import TerminalDimensions, TerminalKey, TerminalScreen, TerminalScreenSnapshot
 from solidlsp.util.subprocess_util import subprocess_kwargs, terminate_process_tree_with_kill_fallback
 
 DEFAULT_YIELD_TIME_MS = 10_000
@@ -262,7 +262,7 @@ class TerminalSession:
             with self._condition:
                 self._condition.wait(timeout=min(remaining, 0.05))
 
-    def write(self, chars: str, submit: bool = False) -> None:
+    def write(self, chars: str, keys: list[TerminalKey] | None = None, submit: bool = False) -> None:
         if self.process.poll() is not None:
             raise RuntimeError(f"Terminal session {self.session_id} has already exited")
         self.last_used = time.monotonic()
@@ -276,7 +276,10 @@ class TerminalSession:
         if self.terminal_screen is None:
             raise RuntimeError(f"Terminal session {self.session_id} has no terminal screen")
 
-        payload = self.terminal_screen.prepare_input(chars, submit=submit)
+        effective_keys = list(keys or [])
+        if submit:
+            effective_keys.append(TerminalKey.ENTER)
+        payload = self.terminal_screen.prepare_input(chars, effective_keys)
         written = 0
         while written < len(payload):
             written += os.write(self.write_fd, payload[written:])
@@ -591,6 +594,7 @@ class TerminalProcessManager:
         chars: str = "",
         yield_time_ms: int | None = None,
         max_output_tokens: int | None = None,
+        keys: list[TerminalKey] | None = None,
         submit: bool = False,
         rows: int | None = None,
         columns: int | None = None,
@@ -600,8 +604,8 @@ class TerminalProcessManager:
             session.set_response_budget(max_output_tokens)
         if rows is not None or columns is not None:
             session.resize(rows=rows, columns=columns)
-        if chars or submit:
-            session.write(chars, submit=submit)
+        if chars or keys or submit:
+            session.write(chars, keys=keys, submit=submit)
             effective_yield = DEFAULT_STDIN_YIELD_TIME_MS if yield_time_ms is None else yield_time_ms
             effective_yield = _bounded(effective_yield, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
         else:
@@ -892,6 +896,7 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
         chars: str = "",
         yield_time_ms: int | None = None,
         max_output_tokens: int | None = None,
+        keys: list[TerminalKey] | None = None,
         submit: bool = False,
         rows: int | None = None,
         columns: int | None = None,
@@ -899,13 +904,15 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
         """
         Write characters to an existing terminal session and return recent bounded output.
 
-        Set submit=true to send chars and Enter together. Set rows or columns only when resizing a PTY.
+        Keep chars literal. Use keys for terminal actions such as ENTER or arrow keys. Text and keys are sent in one write.
+        Set rows or columns only when resizing a PTY.
 
         :param terminal_session_id: terminal session identifier returned as `session_id` by `exec_command`
-        :param chars: characters to write to stdin. Empty string polls unless submit=true.
+        :param chars: literal characters to write to stdin. Newline is not converted to Enter.
         :param yield_time_ms: wait before yielding output. Non-empty writes default to 250 ms; empty polls default to 5000 ms.
         :param max_output_tokens: approximate output budget for this response. Defaults to 10000 tokens.
-        :param submit: append Enter to chars in the same prepared input write. Uses bracketed paste when the application enables it.
+        :param keys: semantic terminal keys to send after chars in the same write, such as ENTER, TAB, ESCAPE, or arrow keys.
+        :param submit: deprecated compatibility input that appends ENTER. Use keys=[ENTER].
         :param rows: resize the PTY to this height before writing or polling.
         :param columns: resize the PTY to this width before writing or polling.
         :return: JSON terminal response. In screen mode, output is the latest complete rendered frame rather than raw ANSI bytes.
@@ -915,6 +922,7 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
             chars=chars,
             yield_time_ms=yield_time_ms,
             max_output_tokens=max_output_tokens,
+            keys=keys,
             submit=submit,
             rows=rows,
             columns=columns,
@@ -928,6 +936,10 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
     @classmethod
     def get_public_param_aliases(cls) -> dict[str, str]:
         return cls.get_param_aliases()
+
+    @classmethod
+    def get_hidden_mcp_params(cls) -> set[str]:
+        return {"submit"}
 
 
 class ListTerminalSessionsTool(Tool):

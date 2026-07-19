@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import codecs
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 
 import pyte
 
@@ -24,6 +26,45 @@ TRACKED_PRIVATE_MODES = (
     BRACKETED_PASTE_ENABLE,
     BRACKETED_PASTE_DISABLE,
 )
+
+
+class TerminalKey(StrEnum):
+    """Semantic terminal key supported by interactive input."""
+
+    ENTER = "ENTER"
+    TAB = "TAB"
+    ESCAPE = "ESCAPE"
+    BACKSPACE = "BACKSPACE"
+    DELETE = "DELETE"
+    INSERT = "INSERT"
+    UP = "UP"
+    DOWN = "DOWN"
+    LEFT = "LEFT"
+    RIGHT = "RIGHT"
+    HOME = "HOME"
+    END = "END"
+    PAGE_UP = "PAGE_UP"
+    PAGE_DOWN = "PAGE_DOWN"
+    CTRL_D = "CTRL_D"
+
+
+TERMINAL_KEY_SEQUENCES: dict[TerminalKey, bytes] = {
+    TerminalKey.ENTER: b"\r",
+    TerminalKey.TAB: b"\t",
+    TerminalKey.ESCAPE: b"\x1b",
+    TerminalKey.BACKSPACE: b"\x7f",
+    TerminalKey.DELETE: b"\x1b[3~",
+    TerminalKey.INSERT: b"\x1b[2~",
+    TerminalKey.UP: b"\x1b[A",
+    TerminalKey.DOWN: b"\x1b[B",
+    TerminalKey.LEFT: b"\x1b[D",
+    TerminalKey.RIGHT: b"\x1b[C",
+    TerminalKey.HOME: b"\x1b[H",
+    TerminalKey.END: b"\x1b[F",
+    TerminalKey.PAGE_UP: b"\x1b[5~",
+    TerminalKey.PAGE_DOWN: b"\x1b[6~",
+    TerminalKey.CTRL_D: b"\x04",
+}
 
 
 @dataclass(frozen=True)
@@ -118,15 +159,14 @@ class TerminalScreen:
                 )
             return self._stable_snapshot
 
-    def prepare_input(self, text: str, submit: bool) -> bytes:
-        """Encode terminal input, optionally pasting and submitting it atomically."""
+    def prepare_input(self, text: str, keys: Sequence[TerminalKey]) -> bytes:
+        """Encode literal text followed by semantic terminal keys as one payload."""
         with self._lock:
-            payload = text
-            if submit and text and self._bracketed_paste:
-                payload = f"\x1b[200~{text}\x1b[201~"
-            if submit:
-                payload += "\r"
-            return payload.encode()
+            text_payload = text.encode()
+            if text and keys and self._bracketed_paste:
+                text_payload = b"\x1b[200~" + text_payload + b"\x1b[201~"
+            key_payload = b"".join(TERMINAL_KEY_SEQUENCES[key] for key in keys)
+            return text_payload + key_payload
 
     def _feed_text(self, text: str) -> None:
         """Feed text while preserving incomplete tracked mode markers."""

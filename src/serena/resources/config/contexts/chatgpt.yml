@@ -16,8 +16,9 @@ prompt: |
   - Use exec_command. Set tty=true only for interactive programs, prompts, REPLs, or TUI applications.
   - Read output according to output_mode: stream is incremental command output; screen is the latest complete
     rendered terminal frame without raw ANSI control sequences.
-  - Use write_stdin with session_id to poll or interact. Set submit=true to send text and Enter together.
-    Use rows and columns only when the PTY must be resized.
+  - Use write_stdin with session_id to poll or interact. Keep chars literal and use semantic keys for terminal
+    actions; for example, send text with keys=["ENTER"] to press Enter in the same write.
+  - Use rows and columns only when the PTY must be resized.
   - Keep output bounded and use log_path only when raw or full output is needed.
   - Account for background processes with list_terminal_sessions, terminal_status, send_terminal_signal,
     and stop_terminal_session. Do not leave sessions unexplained.
