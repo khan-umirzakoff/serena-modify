@@ -142,6 +142,74 @@ def test_write_stdin_sends_input_to_process(tmp_path: Path) -> None:
     assert "echo:hello" in second.output
 
 
+def test_write_stdin_submits_text_with_enter(tmp_path: Path) -> None:
+    manager = TerminalProcessManager()
+    command = _python_command("import sys; line = sys.stdin.readline(); print('submitted:' + line.strip(), flush=True)")
+
+    first = manager.exec_command(command, cwd=tmp_path, yield_time_ms=250, tty=True)
+    assert first.session_id is not None
+
+    second = manager.write_stdin(first.session_id, chars="atomic task", submit=True, yield_time_ms=1000)
+
+    assert second.running is False
+    assert second.exit_code == 0
+    assert "submitted:atomic task" in second.rendered_screen
+
+
+def test_pty_response_renders_ansi_instead_of_returning_raw_sequences(tmp_path: Path) -> None:
+    manager = TerminalProcessManager()
+    command = _python_command("import sys; sys.stdout.write('old\\x1b[3Dnew'); sys.stdout.flush()")
+
+    response = manager.exec_command(command, cwd=tmp_path, yield_time_ms=1000, tty=True)
+
+    assert response.exit_code == 0
+    assert response.output == "new"
+    assert response.rendered_screen == "new"
+    assert "\x1b[" not in response.output
+    assert Path(response.log_path).read_bytes() == b"old\x1b[3Dnew"
+
+
+def test_pty_rendered_snapshot_obeys_output_budget(tmp_path: Path) -> None:
+    manager = TerminalProcessManager()
+    command = _python_command("print('x' * 5000, end='', flush=True)")
+
+    response = manager.exec_command(
+        command,
+        cwd=tmp_path,
+        yield_time_ms=1000,
+        max_output_tokens=256,
+        tty=True,
+        rows=10,
+        columns=1000,
+    )
+
+    assert response.rendered_screen == response.output
+    assert len(response.output.encode()) < 1200
+    assert response.omitted_bytes > 0
+    assert b"x" * 5000 in Path(response.log_path).read_bytes()
+
+
+def test_pty_initial_size_and_resize_are_reported_to_process(tmp_path: Path) -> None:
+    manager = TerminalProcessManager()
+    command = _python_command(
+        "import os, sys; "
+        "size = os.get_terminal_size(); print(f'initial:{size.columns}x{size.lines}', flush=True); "
+        "sys.stdin.readline(); "
+        "size = os.get_terminal_size(); print(f'resized:{size.columns}x{size.lines}', flush=True)"
+    )
+
+    first = manager.exec_command(command, cwd=tmp_path, yield_time_ms=250, tty=True, rows=30, columns=100)
+    assert first.session_id is not None
+    assert "initial:100x30" in first.rendered_screen
+
+    second = manager.write_stdin(first.session_id, submit=True, rows=40, columns=120, yield_time_ms=1000)
+
+    assert second.exit_code == 0
+    assert "resized:120x40" in second.rendered_screen
+    assert second.terminal_rows == 40
+    assert second.terminal_columns == 120
+
+
 def test_pipe_session_rejects_regular_stdin(tmp_path: Path) -> None:
     manager = TerminalProcessManager()
     command = _python_command("import time; time.sleep(1)")
@@ -236,6 +304,7 @@ def test_list_and_stop_terminal_sessions(tmp_path: Path) -> None:
     sessions = manager.list_sessions()
     assert [session["session_id"] for session in sessions] == [first.session_id]
     assert sessions[0]["transport"] == "pty"
+    assert "rendered_screen" not in sessions[0]
 
     status = manager.session_status(first.session_id, include_output=True)
     assert status["session_id"] == first.session_id

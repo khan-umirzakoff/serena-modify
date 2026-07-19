@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import cast
 
 from serena.tools import Tool, ToolMarkerCanEdit
+from serena.tools.terminal_screen import TerminalDimensions, TerminalScreen, TerminalScreenSnapshot
 from solidlsp.util.subprocess_util import subprocess_kwargs, terminate_process_tree_with_kill_fallback
 
 DEFAULT_YIELD_TIME_MS = 10_000
@@ -71,6 +72,19 @@ def _approx_token_count(text: str) -> int:
 
 def _chunk_id() -> str:
     return secrets.token_hex(3)
+
+
+def _set_pty_size(fd: int, dimensions: TerminalDimensions) -> None:
+    """Set the kernel PTY window size."""
+    if os.name != "posix":
+        return
+
+    import fcntl
+    import struct
+    import termios
+
+    packed_dimensions = struct.pack("HHHH", dimensions.rows, dimensions.columns, 0, 0)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, packed_dimensions)
 
 
 def _resolve_terminal_signal(signal_name: str) -> tuple[str, signal.Signals]:
@@ -161,6 +175,13 @@ class TerminalResponse:
     omitted_bytes: int
     log_path: str
     transport: str
+    rendered_screen: str | None = None
+    cursor_row: int | None = None
+    cursor_column: int | None = None
+    terminal_rows: int | None = None
+    terminal_columns: int | None = None
+    synchronized_output: bool = False
+    bracketed_paste: bool = False
     timed_out: bool = False
     pty_requested_but_pipe_used: bool = False
     warnings: list[str] = field(default_factory=list)
@@ -182,6 +203,7 @@ class TerminalSession:
         log_path: Path,
         transport: str,
         max_output_bytes: int,
+        terminal_screen: TerminalScreen | None,
     ) -> None:
         self.session_id = session_id
         self.command = command
@@ -191,6 +213,8 @@ class TerminalSession:
         self.write_fd = write_fd
         self.log_path = log_path
         self.transport = transport
+        self.terminal_screen = terminal_screen
+        self._max_response_bytes = max_output_bytes
         self.started_at = time.monotonic()
         self.last_used = self.started_at
         self._pending_output = HeadTailBuffer(max_output_bytes)
@@ -214,9 +238,13 @@ class TerminalSession:
                     self._pending_output.push(chunk)
                     self._all_output.push(chunk)
                     self._log_file.write(chunk)
+                    if self.terminal_screen is not None:
+                        self.terminal_screen.feed(chunk)
                     self._condition.notify_all()
         finally:
             with self._condition:
+                if self.terminal_screen is not None:
+                    self.terminal_screen.finish()
                 self._reader_done = True
                 self._condition.notify_all()
             try:
@@ -240,7 +268,7 @@ class TerminalSession:
             with self._condition:
                 self._condition.wait(timeout=min(remaining, 0.05))
 
-    def write(self, chars: str) -> None:
+    def write(self, chars: str, submit: bool = False) -> None:
         if self.process.poll() is not None:
             raise RuntimeError(f"Terminal session {self.session_id} has already exited")
         self.last_used = time.monotonic()
@@ -251,7 +279,42 @@ class TerminalSession:
             raise RuntimeError("stdin is closed for non-PTY sessions; start exec_command with tty=true for interactive input")
         if self.write_fd is None:
             raise RuntimeError(f"Terminal session {self.session_id} stdin is closed")
-        os.write(self.write_fd, chars.encode())
+        if self.terminal_screen is None:
+            raise RuntimeError(f"Terminal session {self.session_id} has no terminal screen")
+
+        payload = self.terminal_screen.prepare_input(chars, submit=submit)
+        written = 0
+        while written < len(payload):
+            written += os.write(self.write_fd, payload[written:])
+
+    def resize(self, rows: int | None = None, columns: int | None = None) -> TerminalDimensions:
+        """Resize a PTY session and notify its foreground process group."""
+        if self.transport != "pty" or self.write_fd is None or self.terminal_screen is None:
+            raise RuntimeError("terminal resize requires a PTY session")
+
+        current = self.terminal_screen.dimensions
+        dimensions = TerminalDimensions(
+            rows=current.rows if rows is None else rows,
+            columns=current.columns if columns is None else columns,
+        )
+
+        _set_pty_size(self.write_fd, dimensions)
+        self.terminal_screen.resize(dimensions)
+        self.last_used = time.monotonic()
+
+        window_signal = getattr(signal, "SIGWINCH", None)
+        if window_signal is not None and self.process.poll() is None:
+            try:
+                os.killpg(self.process.pid, window_signal)
+            except OSError:
+                self.process.send_signal(window_signal)
+        return dimensions
+
+    def set_response_budget(self, max_output_tokens: int) -> None:
+        """Apply a new bounded-output budget to subsequent responses."""
+        with self._condition:
+            self._max_response_bytes = _max_output_bytes(max_output_tokens)
+            self._pending_output = HeadTailBuffer(self._max_response_bytes)
 
     def send_signal(self, signal_name: str) -> str:
         canonical, signum = _resolve_terminal_signal(signal_name)
@@ -274,12 +337,16 @@ class TerminalSession:
         self.last_used = time.monotonic()
         timed_out = self._wait_for_yield(yield_time_ms)
         running = self.process.poll() is None
-        if drain:
-            output_bytes, omitted = self._pending_output.drain()
-        else:
-            output_bytes = self._all_output.snapshot()
-            omitted = self._all_output.omitted_bytes
-        output = output_bytes.decode("utf-8", errors="replace")
+        with self._condition:
+            if drain:
+                output_bytes, omitted = self._pending_output.drain()
+            else:
+                output_bytes = self._all_output.snapshot()
+                omitted = self._all_output.omitted_bytes
+            screen_snapshot = self.terminal_screen.snapshot() if self.terminal_screen is not None else None
+
+        output, screen_omitted = self._response_output(output_bytes, screen_snapshot)
+        omitted += screen_omitted
         duration_ms = int((time.monotonic() - self.started_at) * 1000)
         return TerminalResponse(
             chunk_id=_chunk_id(),
@@ -296,9 +363,31 @@ class TerminalSession:
             omitted_bytes=omitted,
             log_path=str(self.log_path),
             transport=self.transport,
+            rendered_screen=output if screen_snapshot is not None else None,
+            cursor_row=screen_snapshot.cursor_row if screen_snapshot is not None else None,
+            cursor_column=screen_snapshot.cursor_column if screen_snapshot is not None else None,
+            terminal_rows=screen_snapshot.dimensions.rows if screen_snapshot is not None else None,
+            terminal_columns=screen_snapshot.dimensions.columns if screen_snapshot is not None else None,
+            synchronized_output=screen_snapshot.synchronized_output if screen_snapshot is not None else False,
+            bracketed_paste=screen_snapshot.bracketed_paste if screen_snapshot is not None else False,
             timed_out=timed_out and running,
             pty_requested_but_pipe_used=False,
         )
+
+    def _response_output(
+        self,
+        output_bytes: bytes,
+        screen_snapshot: TerminalScreenSnapshot | None,
+        max_output_bytes: int | None = None,
+    ) -> tuple[str, int]:
+        """Select readable output while keeping raw PTY bytes in the session log."""
+        if screen_snapshot is None:
+            return output_bytes.decode("utf-8", errors="replace"), 0
+
+        buffer = HeadTailBuffer(self._max_response_bytes if max_output_bytes is None else max_output_bytes)
+        buffer.push(screen_snapshot.text.encode())
+        bounded_screen, omitted = buffer.drain()
+        return bounded_screen.decode("utf-8", errors="replace"), omitted
 
     def terminate(self) -> None:
         if self.process.poll() is None:
@@ -321,6 +410,22 @@ class TerminalSession:
             "duration_ms": int((time.monotonic() - self.started_at) * 1000),
             "last_used_age_ms": int((time.monotonic() - self.last_used) * 1000),
             "log_path": str(self.log_path),
+            **self._screen_info(),
+        }
+
+    def _screen_info(self) -> dict[str, object]:
+        """Describe the latest rendered terminal state."""
+        if self.terminal_screen is None:
+            return {}
+
+        snapshot = self.terminal_screen.snapshot()
+        return {
+            "cursor_row": snapshot.cursor_row,
+            "cursor_column": snapshot.cursor_column,
+            "terminal_rows": snapshot.dimensions.rows,
+            "terminal_columns": snapshot.dimensions.columns,
+            "synchronized_output": snapshot.synchronized_output,
+            "bracketed_paste": snapshot.bracketed_paste,
         }
 
     def status(self, include_output: bool = False, max_output_tokens: int | None = None) -> dict[str, object]:
@@ -329,17 +434,23 @@ class TerminalSession:
         status = self.info()
         status["reader_done"] = self._reader_done
         if include_output:
-            output_bytes = self._all_output.snapshot()
-            omitted = self._all_output.omitted_bytes
-            if max_output_tokens is not None:
-                buffer = HeadTailBuffer(_max_output_bytes(max_output_tokens))
-                buffer.push(output_bytes)
-                output_bytes, extra_omitted = buffer.drain()
-                omitted += extra_omitted
-            output = output_bytes.decode("utf-8", errors="replace")
+            with self._condition:
+                output_bytes = self._all_output.snapshot()
+                omitted = self._all_output.omitted_bytes
+                if max_output_tokens is not None:
+                    buffer = HeadTailBuffer(_max_output_bytes(max_output_tokens))
+                    buffer.push(output_bytes)
+                    output_bytes, extra_omitted = buffer.drain()
+                    omitted += extra_omitted
+                screen_snapshot = self.terminal_screen.snapshot() if self.terminal_screen is not None else None
+
+            response_budget = _max_output_bytes(max_output_tokens) if max_output_tokens is not None else None
+            output, screen_omitted = self._response_output(output_bytes, screen_snapshot, max_output_bytes=response_budget)
+            omitted += screen_omitted
             status.update(
                 {
                     "output": output,
+                    "rendered_screen": output if screen_snapshot is not None else None,
                     "original_token_count": _approx_token_count(output),
                     "omitted_bytes": omitted,
                 }
@@ -419,11 +530,14 @@ class TerminalProcessManager:
         shell: str | None = None,
         login: bool = False,
         tty: bool = False,
+        rows: int = 24,
+        columns: int = 80,
     ) -> TerminalResponse:
         session_id = self._allocate_session_id()
         log_path = Path(tempfile.gettempdir()) / f"serena-exec-{session_id}-{int(time.time() * 1000)}.log"
         env = os.environ.copy()
         env.update(UNIFIED_EXEC_ENV)
+        terminal_dimensions = TerminalDimensions(rows=rows, columns=columns)
 
         shell_path = shell or os.environ.get("SHELL")
         if shell_path:
@@ -440,7 +554,9 @@ class TerminalProcessManager:
         if transport == "pty":
             import pty
 
+            env["TERM"] = "xterm-256color"
             master_fd, slave_fd = pty.openpty()
+            _set_pty_size(slave_fd, terminal_dimensions)
             process = subprocess.Popen(
                 argv,
                 cwd=str(cwd),
@@ -456,6 +572,7 @@ class TerminalProcessManager:
             os.close(slave_fd)
             output_fd = master_fd
             write_fd = master_fd
+            terminal_screen: TerminalScreen | None = TerminalScreen(terminal_dimensions)
         else:
             process = subprocess.Popen(
                 argv,
@@ -471,6 +588,7 @@ class TerminalProcessManager:
             assert process.stdout is not None
             output_fd = os.dup(process.stdout.fileno())
             write_fd = None
+            terminal_screen = None
         process = cast(subprocess.Popen[bytes], process)
         session = TerminalSession(
             session_id=session_id,
@@ -482,6 +600,7 @@ class TerminalProcessManager:
             log_path=log_path,
             transport=transport,
             max_output_bytes=_max_output_bytes(max_output_tokens),
+            terminal_screen=terminal_screen,
         )
         try:
             self._register(session)
@@ -500,13 +619,17 @@ class TerminalProcessManager:
         chars: str = "",
         yield_time_ms: int | None = None,
         max_output_tokens: int | None = None,
+        submit: bool = False,
+        rows: int | None = None,
+        columns: int | None = None,
     ) -> TerminalResponse:
         session = self._get(session_id)
         if max_output_tokens is not None:
-            # Apply the requested budget to newly returned output without changing the session's full retained log.
-            session._pending_output = HeadTailBuffer(_max_output_bytes(max_output_tokens))
-        if chars:
-            session.write(chars)
+            session.set_response_budget(max_output_tokens)
+        if rows is not None or columns is not None:
+            session.resize(rows=rows, columns=columns)
+        if chars or submit:
+            session.write(chars, submit=submit)
             effective_yield = DEFAULT_STDIN_YIELD_TIME_MS if yield_time_ms is None else yield_time_ms
             effective_yield = _bounded(effective_yield, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
         else:
@@ -542,7 +665,7 @@ class TerminalProcessManager:
     ) -> tuple[str, TerminalResponse]:
         session = self._get(session_id)
         if max_output_tokens is not None:
-            session._pending_output = HeadTailBuffer(_max_output_bytes(max_output_tokens))
+            session.set_response_budget(max_output_tokens)
         canonical = session.send_signal(signal_name)
         response = session.collect_response(_bounded(yield_time_ms, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS))
         self._unregister_if_exited(session)
@@ -751,6 +874,8 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
         shell: str | None = None,
         login: bool = False,
         tty: bool = False,
+        rows: int = 24,
+        columns: int = 80,
     ) -> str:
         """
         Run a shell command with Codex-style bounded output and session handling.
@@ -761,8 +886,10 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
         :param max_output_tokens: approximate output budget. Defaults to 10000 tokens.
         :param shell: shell binary to use. Defaults to the user's SHELL when available.
         :param login: run the shell with login semantics when supported by the selected shell.
-        :param tty: request a PTY for interactive commands that need stdin, prompts, REPLs, or console behavior.
-        :return: JSON terminal response with output, exit code or session ID, and temp log path
+        :param tty: request a rendered xterm-compatible PTY for interactive commands, prompts, REPLs, and TUI applications.
+        :param rows: initial PTY height in rows. Defaults to 24 and applies only when tty=true.
+        :param columns: initial PTY width in columns. Defaults to 80 and applies only when tty=true.
+        :return: JSON terminal response. PTY responses include a stable rendered_screen; raw PTY bytes remain in log_path.
         """
         project_root = Path(self.get_project_root()).resolve()
         workdir_path = _resolve_workdir(str(project_root), workdir)
@@ -774,6 +901,8 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
             shell=shell,
             login=login,
             tty=tty,
+            rows=rows,
+            columns=columns,
         )
         response = _with_context_warnings(response, project_root, workdir_path, self.agent.get_workspace_id())
         return _json_response(response)
@@ -790,21 +919,30 @@ class WriteStdinTool(Tool, ToolMarkerCanEdit):
         chars: str = "",
         yield_time_ms: int | None = None,
         max_output_tokens: int | None = None,
+        submit: bool = False,
+        rows: int | None = None,
+        columns: int | None = None,
     ) -> str:
         """
         Write characters to an existing terminal session and return recent bounded output.
 
         :param terminal_session_id: terminal session identifier returned as `session_id` by `exec_command`
-        :param chars: bytes/characters to write to stdin. Empty string polls without writing.
+        :param chars: characters to write to stdin. Empty string polls unless submit=true.
         :param yield_time_ms: wait before yielding output. Non-empty writes default to 250 ms; empty polls default to 5000 ms.
         :param max_output_tokens: approximate output budget for this response. Defaults to 10000 tokens.
-        :return: JSON terminal response with recent output, exit status, and continuing session ID if still running
+        :param submit: append Enter to chars in the same prepared input write. Uses bracketed paste when the application enables it.
+        :param rows: resize the PTY to this height before writing or polling.
+        :param columns: resize the PTY to this width before writing or polling.
+        :return: JSON terminal response with the latest complete rendered_screen, exit status, and session ID if still running
         """
         response = self.agent.get_terminal_process_manager().write_stdin(
             session_id=terminal_session_id,
             chars=chars,
             yield_time_ms=yield_time_ms,
             max_output_tokens=max_output_tokens,
+            submit=submit,
+            rows=rows,
+            columns=columns,
         )
         return _json_response(response)
 
