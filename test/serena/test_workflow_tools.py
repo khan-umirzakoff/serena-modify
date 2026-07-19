@@ -1,9 +1,11 @@
+import json
 from pathlib import Path
 
 from serena.tools.task_catalog import discover_task_catalog
 from serena.tools.tools_base import ToolRegistry
 from serena.tools.workflow_tools import (
     MAX_GOAL_OBJECTIVE_CHARS,
+    ProjectInstructionSettings,
     _apply_codex_style_patch,
     _compact_validation_hints,
     _edit_policy_contract,
@@ -17,6 +19,7 @@ from serena.tools.workflow_tools import (
     _load_instruction_documents,
     _normalize_validation_id,
     _parse_validation_diagnostics,
+    _project_instruction_settings,
     _resolve_focus_dir,
     _resolve_git_root,
     _resolve_review_target,
@@ -70,6 +73,47 @@ def test_load_instruction_documents_prefers_override_and_preserves_scope_order(t
         "src/feature/AGENTS.md",
     ]
     assert [document.contents for document in documents] == ["root instructions", "src override", "feature instructions"]
+
+
+def test_load_instruction_documents_includes_global_guidance_and_project_fallback(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    focus_dir = project_root / "src"
+    focus_dir.mkdir(parents=True)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "AGENTS.md").write_text("global instructions", encoding="utf-8")
+    (project_root / "TEAM_GUIDE.md").write_text("project fallback", encoding="utf-8")
+    (focus_dir / "AGENTS.md").write_text("focus instructions", encoding="utf-8")
+    settings = ProjectInstructionSettings(codex_home=codex_home, fallback_filenames=("TEAM_GUIDE.md",), max_bytes=32768)
+
+    documents = _load_instruction_documents(project_root, focus_dir, max_total_bytes=settings.max_bytes, settings=settings)
+
+    assert [document.contents for document in documents] == ["global instructions", "project fallback", "focus instructions"]
+    assert documents[0].relative_path == str(codex_home / "AGENTS.md")
+
+
+def test_project_instruction_settings_honor_codex_config(tmp_path: Path) -> None:
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        'project_doc_max_bytes = 49152\nproject_doc_fallback_filenames = ["TEAM_GUIDE.md", "../unsafe.md"]\n',
+        encoding="utf-8",
+    )
+
+    settings = _project_instruction_settings(codex_home)
+
+    assert settings.max_bytes == 49152
+    assert settings.fallback_filenames == ("TEAM_GUIDE.md",)
+
+
+def test_load_instruction_documents_skips_empty_override(tmp_path: Path) -> None:
+    project_root = tmp_path
+    (project_root / "AGENTS.override.md").write_text("\n", encoding="utf-8")
+    (project_root / "AGENTS.md").write_text("default instructions", encoding="utf-8")
+
+    documents = _load_instruction_documents(project_root, project_root, max_total_bytes=32768)
+
+    assert [document.contents for document in documents] == ["default instructions"]
 
 
 def test_load_instruction_documents_truncates_to_byte_budget(tmp_path: Path) -> None:
@@ -288,15 +332,11 @@ def test_goal_public_state_and_response_include_remaining_budget(tmp_path: Path)
     response = _goal_response(public, include_completion_report=True)
     assert response["remaining_tokens"] == 75
     assert "tokens_used=25" in response["completion_budget_report"]
-    assert response["runtime_prompts"]["continuation"].startswith('<codex_internal_context source="serena_goal_continuation">')
-    continuation = response["runtime_prompts"]["continuation"]
-    assert "<objective>\nfinish harness\n</objective>" in continuation
-    assert "Continuation behavior:" in continuation
-    assert "Completion audit:" in continuation
-    assert "Blocked audit:" in continuation
-    assert "Do not call update_goal unless the goal is complete" in continuation
-    assert "Tokens remaining: 75" in response["runtime_prompts"]["objective_updated"]
-    assert "Time spent pursuing goal:" in response["runtime_prompts"]["budget_limit"]
+    assert "runtime_prompts" not in response
+    assert len(response["guidance"]) == 3
+    assert "full objective" in response["guidance"][0]
+    assert "three goal turns" in response["guidance"][2]
+    assert len(json.dumps(response)) < 2000
 
 
 def test_update_plan_validation_matches_codex_shape() -> None:

@@ -16,7 +16,10 @@ description: Short task-matching description.
 Optional metadata can be declared in `agents/openai.yaml` next to `SKILL.md`:
 
 ```yaml
-short-description: Compact display text
+interface:
+  display_name: Example Skill
+  short_description: Compact display text
+  default_prompt: Use the skill for this task.
 policy:
   allow_implicit_invocation: true
   allow_scripts: false
@@ -24,15 +27,17 @@ policy:
     - read_file
 dependencies:
   tools:
-    - read_file
-  mcp_servers:
-    - SERENA_MCP_local
+    - type: mcp
+      value: SERENA_MCP_local
+      description: Serena MCP server
 resources:
   references:
     - references/workflow.md
   scripts: []
   assets: []
 ```
+
+Legacy top-level `short-description`, string tool dependencies, and `mcp_servers` remain supported for existing skills.
 
 ## Discovery roots
 
@@ -42,6 +47,9 @@ Serena scans these roots:
 - `<project>/.agents/skills`
 - scoped `.agents/skills` directories from the project root to the active focus path
 - `~/.agents/skills`
+- `/etc/codex/skills`
+
+Skills disabled through `[[skills.config]]` entries in the active Codex `config.toml` are omitted from discovery.
 
 ## Progressive disclosure
 

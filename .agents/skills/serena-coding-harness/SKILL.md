@@ -1,8 +1,6 @@
 ---
 name: serena-coding-harness
 description: Build and verify Serena MCP coding-harness features with Codex-style discipline.
-metadata:
-  short-description: Serena MCP harness implementation workflow
 ---
 
 Use this skill when modifying Serena MCP tools, workflow contracts, validation helpers, or coding-harness behavior.

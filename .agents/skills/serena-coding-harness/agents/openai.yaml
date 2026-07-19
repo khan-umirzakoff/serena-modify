@@ -1,4 +1,7 @@
-short-description: Serena MCP harness workflow
+interface:
+  display_name: Serena Coding Harness
+  short_description: Serena MCP harness workflow
+  default_prompt: Build and verify the requested Serena coding-harness change.
 policy:
   allow_implicit_invocation: true
   allow_scripts: false
@@ -10,12 +13,9 @@ policy:
     - finalize_coding_task
 dependencies:
   tools:
-    - prepare_coding_task
-    - discover_skills
-    - read_skill
-    - run_validation
-  mcp_servers:
-    - SERENA_MCP_local
+    - type: mcp
+      value: SERENA_MCP_local
+      description: Serena MCP server
 resources:
   references:
     - references/workflow.md

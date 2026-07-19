@@ -5,6 +5,8 @@ Tools and helpers for Codex-compatible skills.
 from __future__ import annotations
 
 import json
+import os
+import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ SKILLS_FILENAME = "SKILL.md"
 SKILL_METADATA_PATH = Path("agents") / "openai.yaml"
 AGENTS_DIR_NAME = ".agents"
 SKILLS_DIR_NAME = "skills"
+DEFAULT_ADMIN_SKILLS_DIR = Path("/etc/codex/skills")
 MAX_SCAN_DEPTH = 6
 MAX_SKILLS_DIRS_PER_ROOT = 2000
 MAX_NAME_LEN = 64
@@ -46,6 +49,18 @@ class SkillResources:
 
 
 @dataclass(frozen=True)
+class SkillInterface:
+    """Optional Codex UI metadata declared by a skill."""
+
+    display_name: str | None = None
+    short_description: str | None = None
+    icon_small: str | None = None
+    icon_large: str | None = None
+    brand_color: str | None = None
+    default_prompt: str | None = None
+
+
+@dataclass(frozen=True)
 class SkillDependencies:
     """Declared tool and MCP dependencies for a skill."""
 
@@ -62,10 +77,21 @@ class SkillMetadata:
     path_to_skill_md: str
     scope: str
     short_description: str | None = None
+    interface: SkillInterface = field(default_factory=SkillInterface)
     policy: SkillPolicy = field(default_factory=SkillPolicy)
     resources: SkillResources = field(default_factory=SkillResources)
     dependencies: SkillDependencies = field(default_factory=SkillDependencies)
     metadata_path: str | None = None
+
+    def to_public_dict(self) -> dict[str, Any]:
+        """Return compact model-facing metadata without empty UI fields."""
+        payload = asdict(self)
+        interface = {key: value for key, value in payload["interface"].items() if value is not None and key != "short_description"}
+        if interface:
+            payload["interface"] = interface
+        else:
+            payload.pop("interface")
+        return payload
 
 
 @dataclass(frozen=True)
@@ -164,9 +190,76 @@ def _read_optional_yaml(path: Path) -> dict[str, Any]:
     return parsed
 
 
+def _disabled_skill_paths(codex_home: Path | None = None) -> set[Path]:
+    """Return skill instruction paths disabled in Codex user configuration."""
+    if codex_home is None:
+        configured_home = os.environ.get("CODEX_HOME")
+        codex_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+
+    config_path = codex_home / "config.toml"
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return set()
+
+    skills_config = _nested_dict(config, "skills").get("config")
+    if not isinstance(skills_config, list):
+        return set()
+
+    disabled_paths: set[Path] = set()
+    for item in skills_config:
+        if not isinstance(item, dict) or item.get("enabled") is not False:
+            continue
+        path_value = item.get("path")
+        if not isinstance(path_value, str) or not path_value.strip():
+            continue
+        disabled_path = Path(path_value).expanduser()
+        if not disabled_path.is_absolute():
+            disabled_path = codex_home / disabled_path
+        disabled_paths.add(disabled_path.resolve())
+    return disabled_paths
+
+
 def _nested_dict(root: dict[str, Any], key: str) -> dict[str, Any]:
     value = root.get(key)
     return value if isinstance(value, dict) else {}
+
+
+def _optional_metadata_text(
+    root: dict[str, Any],
+    key: str,
+    field_name: str,
+    max_len: int = MAX_DESCRIPTION_LEN,
+    single_line: bool = True,
+) -> str | None:
+    """Return one validated optional metadata text value."""
+    value = root.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"invalid {field_name}: expected string")
+    if single_line:
+        return _validate_required_text(value, field_name, max_len)
+
+    value = value.strip()
+    if not value:
+        raise ValueError(f"missing field `{field_name}`")
+    if len(value) > max_len:
+        raise ValueError(f"invalid {field_name}: exceeds maximum length of {max_len} characters")
+    return value
+
+
+def _parse_skill_interface(openai_metadata: dict[str, Any]) -> SkillInterface:
+    """Parse the current Codex ``interface`` metadata object."""
+    interface = _nested_dict(openai_metadata, "interface")
+    return SkillInterface(
+        display_name=_optional_metadata_text(interface, "display_name", "interface.display_name"),
+        short_description=_optional_metadata_text(interface, "short_description", "interface.short_description"),
+        icon_small=_optional_metadata_text(interface, "icon_small", "interface.icon_small", 2048),
+        icon_large=_optional_metadata_text(interface, "icon_large", "interface.icon_large", 2048),
+        brand_color=_optional_metadata_text(interface, "brand_color", "interface.brand_color", 64),
+        default_prompt=_optional_metadata_text(interface, "default_prompt", "interface.default_prompt", 4000, single_line=False),
+    )
 
 
 def _parse_skill_policy(openai_metadata: dict[str, Any]) -> SkillPolicy:
@@ -178,9 +271,29 @@ def _parse_skill_policy(openai_metadata: dict[str, Any]) -> SkillPolicy:
     )
 
 
+def _official_dependency_values(openai_metadata: dict[str, Any], dependency_type: str) -> list[str]:
+    """Return values from current Codex object-style tool dependencies."""
+    dependencies = _nested_dict(openai_metadata, "dependencies")
+    declared_tools = dependencies.get("tools")
+    if not isinstance(declared_tools, list):
+        return []
+
+    values: list[str] = []
+    for item in declared_tools:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        value = item.get("value")
+        if isinstance(item_type, str) and item_type.strip().lower() == dependency_type and isinstance(value, str) and value.strip():
+            values.append(_sanitize_single_line(value))
+    return values
+
+
 def _dependency_tools(openai_metadata: dict[str, Any]) -> list[str]:
     dependencies = _nested_dict(openai_metadata, "dependencies")
     tools = _as_string_list(dependencies.get("tools"))
+    tools.extend(_official_dependency_values(openai_metadata, "tool"))
+    tools.extend(_official_dependency_values(openai_metadata, "function"))
     tools.extend(_as_string_list(openai_metadata.get("tools")))
     return sorted(set(tools))
 
@@ -188,6 +301,7 @@ def _dependency_tools(openai_metadata: dict[str, Any]) -> list[str]:
 def _dependency_mcp_servers(openai_metadata: dict[str, Any]) -> list[str]:
     dependencies = _nested_dict(openai_metadata, "dependencies")
     servers = _as_string_list(dependencies.get("mcp_servers"))
+    servers.extend(_official_dependency_values(openai_metadata, "mcp"))
     servers.extend(_as_string_list(dependencies.get("mcpServers")))
     servers.extend(_as_string_list(openai_metadata.get("mcp_servers")))
     servers.extend(_as_string_list(openai_metadata.get("mcpServers")))
@@ -230,15 +344,16 @@ def _parse_skill_file(path: Path, scope: str) -> SkillMetadata:
     skill_dir = path.parent
     metadata_path = skill_dir / SKILL_METADATA_PATH
     openai_metadata = _read_optional_yaml(metadata_path)
+    interface = _parse_skill_interface(openai_metadata)
 
     name = _validate_required_text(str(parsed.get("name") or _default_skill_name(path)), "name", MAX_NAME_LEN)
     description = _validate_required_text(str(parsed.get("description") or ""), "description", MAX_DESCRIPTION_LEN)
     metadata = parsed.get("metadata") or {}
-    short_description = None
-    if isinstance(metadata, dict) and metadata.get("short-description"):
-        short_description = _validate_required_text(str(metadata["short-description"]), "metadata.short-description", MAX_DESCRIPTION_LEN)
-    elif openai_metadata.get("short-description"):
+    short_description = interface.short_description
+    if short_description is None and openai_metadata.get("short-description"):
         short_description = _validate_required_text(str(openai_metadata["short-description"]), "short-description", MAX_DESCRIPTION_LEN)
+    elif short_description is None and isinstance(metadata, dict) and metadata.get("short-description"):
+        short_description = _validate_required_text(str(metadata["short-description"]), "metadata.short-description", MAX_DESCRIPTION_LEN)
 
     return SkillMetadata(
         name=name,
@@ -246,6 +361,7 @@ def _parse_skill_file(path: Path, scope: str) -> SkillMetadata:
         short_description=short_description,
         path_to_skill_md=str(path.resolve()),
         scope=scope,
+        interface=interface,
         policy=_parse_skill_policy(openai_metadata),
         resources=_declared_resource_paths(openai_metadata, skill_dir),
         dependencies=SkillDependencies(
@@ -270,7 +386,12 @@ def _dirs_between_project_root_and_focus(project_root: Path, focus_dir: Path) ->
     return scoped_dirs
 
 
-def skill_roots(project_root: Path, focus_dir: Path, home_dir: Path | None = None) -> list[SkillRoot]:
+def skill_roots(
+    project_root: Path,
+    focus_dir: Path,
+    home_dir: Path | None = None,
+    admin_skills_dir: Path | None = None,
+) -> list[SkillRoot]:
     """Return Codex-compatible skill roots for an active Serena project and focus directory."""
     roots: list[SkillRoot] = [SkillRoot(project_root / ".serena" / SKILLS_DIR_NAME, "repo")]
     for directory in _dirs_between_project_root_and_focus(project_root, focus_dir):
@@ -278,6 +399,7 @@ def skill_roots(project_root: Path, focus_dir: Path, home_dir: Path | None = Non
     if home_dir is None:
         home_dir = Path.home()
     roots.append(SkillRoot(home_dir / AGENTS_DIR_NAME / SKILLS_DIR_NAME, "user"))
+    roots.append(SkillRoot(admin_skills_dir or DEFAULT_ADMIN_SKILLS_DIR, "admin"))
 
     seen: set[Path] = set()
     deduped: list[SkillRoot] = []
@@ -330,16 +452,19 @@ def _iter_skill_files(root: Path) -> tuple[list[Path], bool]:
     return skill_files, truncated
 
 
-def discover_skills(project_root: Path, focus_dir: Path) -> SkillLoadOutcome:
+def discover_skills(project_root: Path, focus_dir: Path, codex_home: Path | None = None) -> SkillLoadOutcome:
     """Discover Codex-compatible skills using progressive-disclosure metadata only."""
     skills: list[SkillMetadata] = []
     errors: list[SkillError] = []
     truncated = False
+    disabled_paths = _disabled_skill_paths(codex_home)
 
     for root in skill_roots(project_root, focus_dir):
         skill_files, root_truncated = _iter_skill_files(root.path)
         truncated = truncated or root_truncated
         for skill_file in skill_files:
+            if skill_file.resolve() in disabled_paths:
+                continue
             try:
                 skills.append(_parse_skill_file(skill_file, root.scope))
             except (OSError, ValueError, yaml.YAMLError) as error:
@@ -460,7 +585,7 @@ class DiscoverSkillsTool(Tool):
         response = {
             "project_root": str(project_root),
             "focus_dir": str(focus_dir),
-            "skills": [asdict(skill) for skill in skills],
+            "skills": [skill.to_public_dict() for skill in skills],
             "dependency_report": skill_dependency_reports(skills, available_tools),
             "omitted_skill_count": max(0, len(outcome.skills) - len(skills)),
             "errors": [asdict(error) for error in outcome.errors],
@@ -501,15 +626,20 @@ class ReadSkillTool(Tool):
             matches = [item for item in outcome.skills if item.name == skill]
             if len(matches) > 1:
                 return _json_response(
-                    {"error": f"multiple skills named {skill!r}; use a SKILL.md path", "matches": [asdict(item) for item in matches]}
+                    {
+                        "error": f"multiple skills named {skill!r}; use a SKILL.md path",
+                        "matches": [item.to_public_dict() for item in matches],
+                    }
                 )
             selected = matches[0] if matches else None
         if selected is None:
-            return _json_response({"error": f"skill not found: {skill}", "available_skills": [asdict(item) for item in outcome.skills]})
+            return _json_response(
+                {"error": f"skill not found: {skill}", "available_skills": [item.to_public_dict() for item in outcome.skills]}
+            )
         contents = Path(selected.path_to_skill_md).read_text(encoding="utf-8")
         available_tools = _active_tool_names()
         response = {
-            "skill": asdict(selected),
+            "skill": selected.to_public_dict(),
             "dependency_report": skill_dependency_reports([selected], available_tools).get(selected.name, {}),
             "contents": contents,
             "usage": "Follow these instructions only for the current task when this skill is relevant.",

@@ -64,6 +64,8 @@ Task IDs include runner information to avoid collisions, for example:
 - `run_validation(validation_id, relative_path=".", files=[...])` selects and runs validation; `files` narrows safe known runners such as `ruff check`, `ruff format`, and `pytest`.
 - `get_validation_commands(relative_path=".")` stays as a backward-compatible public-only wrapper around the catalog's validation hints.
 - `prepare_coding_task` includes `task_catalog_summary`, compact `edit_policy`, and only a small public top-task list by default.
+- `prepare_coding_task` loads global and scoped `AGENTS` guidance in Codex order, honors `project_doc_fallback_filenames`
+  and `project_doc_max_bytes`, and skips empty override files before trying lower-precedence names.
 - Edit policy is explicit: inspect unfamiliar code first, use semantic tools for symbol-aware changes, use `replace_content` for exact small edits with `allow_multiple_occurrences=false`, and reserve `apply_patch` for atomic multi-file or structured textual patches.
 - Scoped task lookup is supported through `relative_path`, so multi-repo workspaces can target `frontend`, `backend`, or a nested package without scanning/running unrelated tasks.
 - `prepare_coding_task(relative_path=...)` and `finalize_coding_task(relative_path=...)` resolve Git status/diff from the nearest nested Git root under the active Serena project, so workspace folders with subrepos report the correct repo state. `prepare_coding_task` also stores the latest focus, letting a short `finalize_coding_task()` call keep the same subrepo context.
