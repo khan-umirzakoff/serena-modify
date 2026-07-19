@@ -242,7 +242,13 @@ class TopLevelCommands(AutoRegisteringGroup):
         type=click.Choice([mode.value for mode in WorkspaceMode]),
         default=WorkspaceMode.SINGLE.value,
         show_default=True,
-        help="Project routing: single uses only --project; multi exposes isolated workspaces for parallel chats.",
+        help="Project routing: single uses one shared switchable project; multi exposes isolated workspaces for parallel chats.",
+    )
+    @click.option(
+        "--fixed-project",
+        is_flag=True,
+        default=False,
+        help="Lock single mode to the startup project and hide project activation.",
     )
     @click.option(
         "--mode",
@@ -328,6 +334,7 @@ class TopLevelCommands(AutoRegisteringGroup):
         project_from_cwd: bool | None,
         context: str,
         workspace_mode: str,
+        fixed_project: bool,
         default_modes: Sequence[str],
         added_modes: Sequence[str],
         language_backend: str | None,
@@ -379,8 +386,12 @@ class TopLevelCommands(AutoRegisteringGroup):
         parsed_workspace_mode = WorkspaceMode(workspace_mode)
         if parsed_workspace_mode.is_multi and project_file is not None:
             raise click.UsageError("--workspace-mode multi cannot be used with --project; each chat opens its own workspace")
+        if parsed_workspace_mode.is_multi and fixed_project:
+            raise click.UsageError("--fixed-project cannot be used with --workspace-mode multi")
         if context == "chatgpt" and not parsed_workspace_mode.is_multi and project_file is None:
             raise click.UsageError("--workspace-mode single with --context chatgpt requires --project")
+        if fixed_project and project_file is None:
+            raise click.UsageError("--fixed-project requires --project")
 
         mode_selection_def: ModeSelectionDefinition | None = None
         if default_modes or added_modes:
@@ -392,6 +403,7 @@ class TopLevelCommands(AutoRegisteringGroup):
             project=project_file,
             memory_log_handler=memory_log_handler,
             workspace_mode=parsed_workspace_mode,
+            fixed_project=fixed_project,
         )
         server = factory.create_mcp_server(
             host=host,

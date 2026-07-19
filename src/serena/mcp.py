@@ -41,7 +41,19 @@ MULTI_WORKSPACE_INSTRUCTIONS = """
 This server is running in multi-workspace mode. At the start of each new chat or independent task, call
 open_workspace with the relevant project path or registered project name. Keep the returned workspace_id private
 to that chat and pass it to every subsequent Serena tool call. Never reuse another chat's workspace_id. If it
-expires, call open_workspace again. Call close_workspace when the task is finished and the workspace is no longer needed.
+expires, call open_workspace again. Within one chat, activate_project may switch that isolated workspace sequentially;
+use separate workspaces for independent or parallel project work. Call close_workspace when the task is finished and
+the workspace is no longer needed.
+""".strip()
+SINGLE_WORKSPACE_INSTRUCTIONS = """
+This server is running in single-workspace mode. The startup project is the initial active project, not a permanent lock.
+Do not look for workspace_id. If the task explicitly moves to another repository, call activate_project with its path or
+registered name, then continue with that project. Project switching is global to this server, so use multi-workspace mode
+instead when independent chats may work in parallel.
+""".strip()
+FIXED_PROJECT_INSTRUCTIONS = """
+This server is running in fixed-project mode. Work only in the startup project; activate_project and workspace management
+are intentionally unavailable. Restart the server with another project only when the user explicitly chooses fixed isolation.
 """.strip()
 
 
@@ -212,6 +224,7 @@ class SerenaMCPFactory:
         project: str | None = None,
         memory_log_handler: MemoryLogHandler | None = None,
         workspace_mode: WorkspaceMode = WorkspaceMode.SINGLE,
+        fixed_project: bool = False,
     ):
         """
         :param transport: The transport to use for the MCP server.
@@ -220,12 +233,14 @@ class SerenaMCPFactory:
             If the project passed here hasn't been registered yet, it will be registered automatically and can be activated by its name
             afterward.
         :param memory_log_handler: the in-memory log handler to use for the agent's logging
-        :param workspace_mode: project-routing mode. Single mode uses only the startup project; multi mode exposes
-            explicit workspace management and per-call routing.
+        :param workspace_mode: project-routing mode. Single mode uses one shared active project that may switch;
+            multi mode exposes explicit workspace management and per-call routing.
+        :param fixed_project: whether to lock single mode to the startup project and hide project activation
         """
         self.transport = transport
         self.context = SerenaAgentContext.load(context)
         self.workspace_mode = workspace_mode
+        self.fixed_project = fixed_project
         self.project = project
         self.agent: SerenaAgent | None = None
         self.memory_log_handler = memory_log_handler
@@ -233,8 +248,12 @@ class SerenaMCPFactory:
         self._agent_config: SerenaConfig | None = None
         self._mode_selection_def: ModeSelectionDefinition | None = None
 
-        # align optional workspace tools with the selected routing mode
-        if not workspace_mode.is_multi and project is not None:
+        # align project switching and optional workspace tools with the selected routing mode
+        if workspace_mode.is_multi and fixed_project:
+            raise ValueError("fixed_project cannot be used with multi-workspace mode")
+        if fixed_project:
+            if project is None:
+                raise ValueError("fixed_project requires a startup project")
             self.context.single_project = True
         included_optional_tools = set(self.context.included_optional_tools)
         if workspace_mode.is_multi:
@@ -546,4 +565,6 @@ class SerenaMCPFactory:
         instructions = self.agent.create_connection_prompt()
         if self.workspace_mode.is_multi:
             return f"{instructions}\n\n{MULTI_WORKSPACE_INSTRUCTIONS}"
-        return instructions
+        if self.context.single_project:
+            return f"{instructions}\n\n{FIXED_PROJECT_INSTRUCTIONS}"
+        return f"{instructions}\n\n{SINGLE_WORKSPACE_INSTRUCTIONS}"

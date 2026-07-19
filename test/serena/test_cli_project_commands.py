@@ -390,12 +390,29 @@ class TestWorkspaceModeValidation:
         assert result.exit_code != 0
         assert "cannot be used with --project" in result.output
 
+    def test_multi_mode_rejects_fixed_project(self, cli_runner):
+        result = cli_runner.invoke(
+            TopLevelCommands.start_mcp_server,
+            ["--context", "chatgpt", "--workspace-mode", "multi", "--fixed-project"],
+        )
+
+        assert result.exit_code != 0
+        assert "cannot be used" in result.output
+
+    def test_fixed_project_requires_startup_project(self, cli_runner):
+        result = cli_runner.invoke(TopLevelCommands.start_mcp_server, ["--fixed-project"])
+
+        assert result.exit_code != 0
+        assert "requires --project" in result.output
+
     def test_workspace_mode_is_documented(self, cli_runner):
         result = cli_runner.invoke(TopLevelCommands.start_mcp_server, ["--help"])
+        normalized_output = " ".join(result.output.split())
 
         assert result.exit_code == 0
         assert "--workspace-mode [single|multi]" in result.output
-        assert "single uses only --project" in result.output
+        assert "single uses one shared switchable project" in normalized_output
+        assert "--fixed-project" in result.output
 
 
 if __name__ == "__main__":

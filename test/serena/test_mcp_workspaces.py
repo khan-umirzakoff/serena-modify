@@ -46,17 +46,25 @@ def test_workspace_tools_are_exposed_only_in_multi_mode() -> None:
         project="/project",
         workspace_mode=WorkspaceMode.SINGLE,
     )
+    fixed_factory = SerenaMCPFactory(
+        transport="stdio",
+        context="chatgpt",
+        project="/project",
+        workspace_mode=WorkspaceMode.SINGLE,
+        fixed_project=True,
+    )
     multi_factory = SerenaMCPFactory(transport="stdio", context="chatgpt", workspace_mode=WorkspaceMode.MULTI)
 
     assert {"open_workspace", "list_workspaces", "close_workspace"} <= set(tool_names)
-    assert single_factory.context.single_project is True
+    assert single_factory.context.single_project is False
+    assert fixed_factory.context.single_project is True
     assert not ({"open_workspace", "list_workspaces", "close_workspace"} & set(single_factory.context.included_optional_tools))
     assert multi_factory.context.single_project is False
     assert {"open_workspace", "list_workspaces", "close_workspace"} <= set(multi_factory.context.included_optional_tools)
 
 
 def test_mcp_schema_matches_workspace_mode() -> None:
-    observed: dict[str, tuple[bool, bool, bool]] = {}
+    observed: dict[str, tuple[bool, bool, bool, bool]] = {}
 
     for workspace_mode in WorkspaceMode:
         factory = SerenaMCPFactory(transport="stdio", context="chatgpt", workspace_mode=workspace_mode)
@@ -72,15 +80,38 @@ def test_mcp_schema_matches_workspace_mode() -> None:
             "open_workspace" in tools,
             "workspace_id" in tools["read_file"].parameters["properties"],
             "open_workspace" in factory._get_initial_instructions(),
+            "activate_project" in tools,
         )
         if factory._workspace_registry is not None:
             factory._workspace_registry.shutdown()
         factory.agent.on_shutdown()
 
     assert observed == {
-        "single": (False, False, False),
-        "multi": (True, True, True),
+        "single": (False, False, False, True),
+        "multi": (True, True, True, True),
     }
+
+
+def test_fixed_project_hides_project_switching(tmp_path: Path) -> None:
+    factory = SerenaMCPFactory(
+        transport="stdio",
+        context="chatgpt",
+        project=str(tmp_path),
+        workspace_mode=WorkspaceMode.SINGLE,
+        fixed_project=True,
+    )
+    server = factory.create_mcp_server(
+        enable_web_dashboard=False,
+        enable_gui_log_window=False,
+        open_web_dashboard=False,
+    )
+    assert factory.agent is not None
+    factory._set_mcp_tools(server, openai_tool_compatible=True, structured_output=False)
+
+    assert "activate_project" not in server._tool_manager._tools
+    assert "fixed-project mode" in factory._get_initial_instructions()
+
+    factory.agent.on_shutdown()
 
 
 def test_chatgpt_harness_ux_is_remote_and_unambiguous() -> None:
@@ -101,6 +132,9 @@ def test_chatgpt_harness_ux_is_remote_and_unambiguous() -> None:
     system_prompt = factory.agent.create_system_prompt()
 
     assert "execute_shell_command" not in tools
+    assert "activate_project" in tools
+    assert "single-workspace mode" in factory._get_initial_instructions()
+    assert "startup project is the initial active project, not a permanent lock" in factory._get_initial_instructions()
     assert "remote MCP coding harness" in system_prompt
     assert "output_mode" in system_prompt
     assert 'keys=["ENTER"]' in system_prompt
