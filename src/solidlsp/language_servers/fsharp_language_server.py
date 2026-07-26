@@ -5,6 +5,7 @@ Provides F# specific instantiation of the LanguageServer class.
 import logging
 import os
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -13,10 +14,11 @@ from overrides import override
 from serena.util.dotnet import DotNETUtil
 from solidlsp.language_servers.common import RuntimeDependency, RuntimeDependencyCollection
 from solidlsp.ls import SolidLanguageServer
-from solidlsp.ls_config import Language, LanguageServerConfig
+from solidlsp.ls_config import LanguageServerConfig, LanguageServerId
 from solidlsp.ls_exceptions import SolidLSPException
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
+from solidlsp.util.subprocess_util import subprocess_run
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +73,7 @@ class FSharpLanguageServer(SolidLanguageServer):
         """
         Setup runtime dependencies for F# Language Server and return the command to start the server.
         """
-        fsharp_settings = solidlsp_settings.get_ls_specific_settings(Language.FSHARP)
+        fsharp_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.FSHARP)
         fsautocomplete_version = fsharp_settings.get("fsautocomplete_version", DEFAULT_FSAUTOCOMPLETE_VERSION)
         dotnet_exe = DotNETUtil("8.0", allow_higher_version=True).get_dotnet_path_or_raise()
 
@@ -104,9 +106,7 @@ class FSharpLanguageServer(SolidLanguageServer):
 
             # Install FsAutoComplete using dotnet tool install
             try:
-                import subprocess
-
-                result = subprocess.run(
+                result = subprocess_run(
                     [dotnet_exe, "tool", "install", "--tool-path", fsharp_ls_dir, "fsautocomplete", "--version", fsautocomplete_version],
                     cwd=fsharp_ls_dir,
                     capture_output=True,
@@ -271,9 +271,7 @@ class FSharpLanguageServer(SolidLanguageServer):
         if dotnet_exe:
             # Try to get the installation path
             try:
-                import subprocess
-
-                result = subprocess.run([dotnet_exe, "--info"], capture_output=True, text=True, check=True)
+                result = subprocess_run([dotnet_exe, "--info"], capture_output=True, text=True, check=True)
                 lines = result.stdout.split("\n")
                 for line in lines:
                     if "Base Path:" in line or "Base path:" in line:

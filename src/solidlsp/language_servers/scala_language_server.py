@@ -15,6 +15,7 @@ from solidlsp.ls_config import LanguageServerConfig
 from solidlsp.ls_utils import PlatformUtils
 from solidlsp.lsp_protocol_handler.server import ProcessLaunchInfo
 from solidlsp.settings import SolidLSPSettings
+from solidlsp.util.subprocess_util import subprocess_run
 
 if not PlatformUtils.get_platform_id().value.startswith("win"):
     pass
@@ -52,7 +53,7 @@ def _get_scala_settings(solidlsp_settings: SolidLSPSettings) -> dict[str, object
         - on_stale_lock: StaleLockMode
         - log_multi_instance_notice: bool
     """
-    from solidlsp.ls_config import Language
+    from solidlsp.ls_config import LanguageServerId
 
     defaults: dict[str, object] = {
         "metals_version": DEFAULT_METALS_VERSION,
@@ -64,7 +65,7 @@ def _get_scala_settings(solidlsp_settings: SolidLSPSettings) -> dict[str, object
     if not solidlsp_settings.ls_specific_settings:
         return defaults
 
-    scala_settings = solidlsp_settings.get_ls_specific_settings(Language.SCALA)
+    scala_settings = solidlsp_settings.get_ls_specific_settings(LanguageServerId.SCALA)
 
     # Parse stale lock mode with validation
     on_stale_lock_str = scala_settings.get("on_stale_lock", DEFAULT_ON_STALE_LOCK)
@@ -120,7 +121,7 @@ class ScalaLanguageServer(SolidLanguageServer):
             config,
             repository_root_path,
             ProcessLaunchInfo(cmd=scala_lsp_executable_path, cwd=repository_root_path),
-            config.code_language.value,
+            config.ls_id.value,
             solidlsp_settings,
         )
 
@@ -220,7 +221,7 @@ class ScalaLanguageServer(SolidLanguageServer):
                 log.info("'cs' command not found. Trying to install it using 'coursier'.")
                 try:
                     log.info("Running 'coursier setup --yes' to install 'cs'...")
-                    subprocess.run([coursier_command_path, "setup", "--yes"], check=True, capture_output=True, text=True)
+                    subprocess_run([coursier_command_path, "setup", "--yes"], check=True, capture_output=True, text=True)
                 except subprocess.CalledProcessError as e:
                     raise RuntimeError(f"Failed to set up 'cs' command with 'coursier setup'. Stderr: {e.stderr}")
 
@@ -232,7 +233,7 @@ class ScalaLanguageServer(SolidLanguageServer):
                 log.info("'cs' command installed successfully.")
 
             log.info(f"metals executable not found at {metals_executable}, bootstrapping...")
-            subprocess.run(["mkdir", "-p", os.path.join(metals_home, metals_version)], check=True)
+            subprocess_run(["mkdir", "-p", os.path.join(metals_home, metals_version)], check=True, capture_output=False)
             artifact = f"org.scalameta:metals_2.13:{metals_version}"
             cmd = [
                 cs_command_path,
@@ -253,7 +254,7 @@ class ScalaLanguageServer(SolidLanguageServer):
                 "-f",
             ]
             log.info("Bootstrapping metals...")
-            subprocess.run(cmd, cwd=metals_home, check=True)
+            subprocess_run(cmd, cwd=metals_home, check=True, capture_output=False)
             log.info("Bootstrapping metals finished.")
         return [metals_executable]
 

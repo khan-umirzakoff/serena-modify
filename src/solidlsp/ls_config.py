@@ -42,6 +42,13 @@ class FilenameMatcher:
         """
         self._file_extensions = list(self._initial_file_extensions)
 
+    @property
+    def file_extensions(self) -> list[str]:
+        """The file extensions currently registered with this matcher, including any added via
+        :meth:`add_extensions`. Returned as a copy.
+        """
+        return list(self._file_extensions)
+
     def add_extensions(self, *file_extensions: str) -> None:
         """
         Add further file extensions to this matcher (idempotent).
@@ -80,7 +87,7 @@ class FilenameMatcher:
         return False
 
 
-class Language(str, Enum):
+class LanguageServerId(str, Enum):
     """
     Enumeration of language servers supported by SolidLSP.
     """
@@ -187,6 +194,8 @@ class Language(str, Enum):
     """Ty language server for Python (instead of pyright, which is the default)."""
     PYTHON_PYREFLY = "python_pyrefly"
     """Pyrefly language server for Python (instead of pyright, which is the default)."""
+    PYTHON_BASEDPYRIGHT = "python_basedpyright"
+    """BasedPyright language server for Python (instead of pyright, which is the default)."""
     CSHARP_OMNISHARP = "csharp_omnisharp"
     """OmniSharp language server for C# (instead of the default csharp-ls by microsoft).
     Currently has problems with finding references, and generally seems less stable and performant.
@@ -279,7 +288,7 @@ class Language(str, Enum):
     """
 
     @classmethod
-    def iter_all(cls, include_experimental: bool = False, include_non_programming_languages: bool = True) -> Iterable[Self]:
+    def iter_all(cls, include_experimental: bool = True, include_non_programming_languages: bool = True) -> Iterable[Self]:
         for lang in cls:
             if include_experimental or not lang.is_experimental():
                 if include_non_programming_languages or lang.is_programming_language():
@@ -287,11 +296,8 @@ class Language(str, Enum):
 
     def is_experimental(self) -> bool:
         """
-        Check if the language server is experimental or deprecated.
-
-        Note for serena users/developers:
-        Experimental languages are not autodetected and must be explicitly specified
-        in the project.yml configuration.
+        Check if the language server is experimental (potentially not robust),
+        secondary (not default for respective language) or deprecated.
         """
         return self in {
             self.ANSIBLE,
@@ -299,6 +305,7 @@ class Language(str, Enum):
             self.PYTHON_JEDI,
             self.PYTHON_TY,
             self.PYTHON_PYREFLY,
+            self.PYTHON_BASEDPYRIGHT,
             self.CSHARP_OMNISHARP,
             self.RUBY_SOLARGRAPH,
             self.PHP_PHPACTOR,
@@ -352,7 +359,7 @@ class Language(str, Enum):
     @cache
     def get_source_fn_matcher(self) -> FilenameMatcher:
         match self:
-            case self.PYTHON | self.PYTHON_JEDI | self.PYTHON_TY | self.PYTHON_PYREFLY:
+            case self.PYTHON | self.PYTHON_JEDI | self.PYTHON_TY | self.PYTHON_PYREFLY | self.PYTHON_BASEDPYRIGHT:
                 return FilenameMatcher(".py", ".pyi")
             case self.JAVA:
                 return FilenameMatcher(".java")
@@ -448,7 +455,8 @@ class Language(str, Enum):
             case self.DART:
                 return FilenameMatcher(".dart")
             case self.PHP | self.PHP_PHPACTOR | self.PHP_PHPANTOM:
-                return FilenameMatcher(".php")
+                # .phtml is a standard (yet outdated) extension for PHP sources
+                return FilenameMatcher(".php", ".phtml")
             case self.R:
                 return FilenameMatcher(".R", ".r", ".Rmd", ".Rnw")
             case self.PERL:
@@ -601,6 +609,10 @@ class Language(str, Enum):
                 from solidlsp.language_servers.pyrefly_server import PyreflyLanguageServer
 
                 return PyreflyLanguageServer
+            case self.PYTHON_BASEDPYRIGHT:
+                from solidlsp.language_servers.basedpyright_server import BasedPyrightLanguageServer
+
+                return BasedPyrightLanguageServer
             case self.JAVA:
                 from solidlsp.language_servers.eclipse_jdtls import EclipseJDTLS
 
@@ -883,7 +895,7 @@ class LanguageServerConfig:
     Configuration parameters for a language server instance
     """
 
-    code_language: Language
+    ls_id: LanguageServerId
     """
     defines the language server to use
     """
@@ -902,7 +914,10 @@ class LanguageServerConfig:
     trace_lsp_communication: bool = False
     start_independent_lsp_process: bool = True
     ignored_paths: list[str] = field(default_factory=list)
-    """Paths, dirs or glob-like patterns. The matching will follow the same logic as for .gitignore entries"""
+    """
+    list of ordered ignore patterns (same syntax as .gitignore; only forward slashes) to be used by the language server
+    for filtering out files and folders from indexing and analysis.
+    """
     encoding: str = "utf-8"
     """File encoding to use when reading source files"""
 

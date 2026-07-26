@@ -61,6 +61,7 @@ To implement a new language server using the DependencyProvider pattern:
 
 **Implementation Pointers::**
   - Override `create_launch_command_env` if the launch command needs environment variables to be set (defaults to `{}` in the base implementation)
+  - When calling subprocesses, e.g. to install dependencies, do not use `subprocess.run` directly; instead, use the `subprocess_run` helper method from `solidlsp.utils.subprocess_utils`
 
 You should look at at least one existing implementation of each base class to understand how they work.
 
@@ -111,12 +112,12 @@ For an example, see `EclipseJDTLS._start_server`.
 
 ## Step 2: Language Registration
 
-### 2.1 Add to Language Enum
+### 2.1 Add to LanguageServerId Enum
 
-In `src/solidlsp/ls_config.py`, add your language to the `Language` enum:
+In `src/solidlsp/ls_config.py`, add your language to the enum:
 
 ```python
-class Language(str, Enum):
+class LanguageServerId(str, Enum):
     # Existing languages...
     NEW_LANGUAGE = "new_language"
     
@@ -125,20 +126,15 @@ class Language(str, Enum):
             # Existing cases...
             case self.NEW_LANGUAGE:
                 return FilenameMatcher(".newlang", ".nl")  # File extensions
-```
 
-### 2.2 Update Language Server Factory
-
-In `src/solidlsp/ls.py`, add your language to the `create` method:
-
-```python
-@classmethod
-def create(cls, config: LanguageServerConfig, repository_root_path: str) -> "SolidLanguageServer":
-    match config.code_language:
-        # Existing cases...
-        case Language.NEW_LANGUAGE:
-            from solidlsp.language_servers.new_language_server import NewLanguageServer
-            return NewLanguageServer(config, repository_root_path)
+    ...
+        
+    def get_ls_class(self) -> type["SolidLanguageServer"]:
+        match self:
+            # Existing cases...
+            case self.NEW_LANGUAGE:
+                from solidlsp.language_servers.new_language_server import NewLanguageServer
+                return NewLanguageServer
 ```
 
 ## Step 3: Test Repository
@@ -213,10 +209,6 @@ You should at least test:
 
 Have a look at `test/solidlsp/php/test_php_basic.py` as an example for what should be tested.
 Don't forget to add a new language marker to `pytest.ini`.
-
-### 4.2 Integration Tests
-
-Consider adding new cases to the parametrized tests in `test_serena_agent.py` for the new language.
 
 
 ### 5 Documentation

@@ -2,6 +2,121 @@
 
 Status of the `main` branch. Changes prior to the next official version change will appear here.
 
+* General:
+  - Fix: a tool call exceeding the timeout blocked the task executor indefinitely; the executor now
+    recovers without user-induced cancellation
+  - Add Grok Build support (context `grok`, setup CLI, hooks)
+  - The `languages` key in project configurations was changed to `language_servers` to better reflect
+    the actual semantics (configurations are automatically migrated)
+  - Fix: glob matching bare `*` and `?` in non-`**` patterns matched across `/`, contradicting documented behaviour #1732
+  - Language servers and their dependency providers now go through the `subprocess_run` helper instead of
+    calling `subprocess.run` directly, so all such subprocesses get `stdin=DEVNULL` and can no longer
+    interfere with the stdio MCP connection (as happened for Julia, #1577) #1748
+
+* Language Servers: 
+  - Allow language server priorities to be configured in `serena_config.yml` (for auto-detection during 
+    project creation) 
+  - Add `python_basedpyright` as an alternative Python language server
+  - Nix/nixd: support custom `ls_path` launchers and external JSON settings through `config_path` #1737
+
+* JetBrains:
+  - `jet_brains_find_symbol`: Disallow wildcard-only search, delegating to overview tool if request is for file
+
+* Language Servers:
+  - `typescript`: Fix: on large projects, the first `find_referencing_symbols`/`request_references` call
+    could silently race tsserver's project load and return incomplete results, because the fixed 2s
+    grace for tsserver to *start* reporting `$/progress` (distinct from the separate, already
+    configurable `indexing_timeout` used to wait for it to *drain*) was hardcoded and not large enough
+    for projects where the initial project-graph resolution itself takes longer than that. The grace
+    is now `indexing_start_grace` (default 5.0s), configurable the same way as `indexing_timeout` and
+    `server_ready_timeout` #1586
+
+* Hooks:
+  - Add `serena-hooks --client=grok`, including Grok-native PreToolUse allow/deny output.
+  - PreToolUse remind hook: coerce non-string shell command values instead of failing, and recognize
+    `target_file`/`targetFile` file-path keys (shared payload parsing, applies to all hook clients).
+
+
+# v1.6.1 (2026-07-21)
+
+* General:
+  - Fix: `FileUtils.read_file`'s `charset_normalizer` fallback (used when a file cannot be decoded with
+    the project's configured `encoding`) decoded the raw bytes directly and therefore skipped the
+    universal-newline translation that the primary read path applies. CR characters from disk thus
+    reached Serena's in-memory file contents, where the rest of the code assumes LF-normalized text and
+    the `line_ending` setting is meant to be the single point of line-ending translation on write. The
+    fallback now normalizes line endings to LF, consistently with the primary path.
+  - Fix: a symbol whose LSP range ended exactly one line past EOF, at column 0 (the convention for
+    a range covering whole lines through the end of the file), raised `IndexError` in
+    `SymbolBody.get_text`. That one well-defined case is now corrected to end at the actual last
+    line; any other out-of-range end position now raises `InvalidTextLocationError` instead,
+    rather than guessing at a body that could be wrong #1498
+
+* Language Servers:
+  - Fix: Properly differentiate between raw and high-level symbol cache fingerprints, avoiding unnecessary
+    invalidations of the raw cache when only the derived high-level representation changes
+  - Fix: Language servers were not notified of external file system changes, causing some
+    symbolic operations (such as `find_referencing_symbols`) to report stale information.
+    An explicit file system polling mechanism is now used to detect changes prior to the affected
+    tool executions.
+  - Fix: Order of ignore patterns passed to language servers was not respected #1729 
+  - Improve uv-based language server launch command compatibility: Use the more widely supported 
+    `uv tool run` instead of `uv x` #1721
+  - Java (JDT-LS): add `runtimes` to `ls_specific_settings.java`, a list of extra JRE/JDK entries
+    (`name`, `path`, optional `default`/`sources`/`javadoc`) passed through to JDT-LS's
+    `java.configuration.runtimes`. Fixes silently broken JDK type resolution (`java.lang.Object`
+    and other JDK types reported as "cannot be resolved") for projects whose source/target level
+    exceeds the bundled JDK 21 JRE JDT-LS registers by default; configured runtimes extend rather
+    than replace that bundled default. #1478
+  - `gopls`: Fix `replace_symbol_body` corrupting single `type`/`var`/`const` declarations by
+    duplicating the leading keyword (e.g. `type Foo` becoming `type type Foo`). gopls reports the
+    symbol range of such declarations starting at the identifier rather than the keyword (unlike
+    `func` declarations); the range is now extended to include the keyword so the body and the
+    replacement range stay consistent.
+  - `typescript` / `typescript_vts`: No longer ignore directories named `coverage`. This was intended to skip
+    coverage-report output, but matched by bare dirname and so also hid legitimate source directories named
+    `coverage` (e.g. `src/routes/coverage/`) from symbol tools. Generated report dirs are already covered by
+    gitignore. Fixes #1523.
+
+* Tools:
+  - Fix: `search_for_pattern` marked one line too many as matched whenever a match ended with a line
+    break, because the match's exclusive end index was mapped to a line number directly and therefore
+    resolved to the start of the following line. The line the match ends on is now determined correctly,
+    which also keeps `context_lines_after` aligned.
+  - `safe_delete`: Add heuristic to delete superfluous empty lines after a deletion
+  - `search_for_pattern`: on overflow, the shortening chain now emits each match's first line (full when
+    it fits, otherwise truncated with a trailing '...' and a note) before falling back to bare line
+    numbers, so agents can pick the right match without re-reading files. #1640
+
+* Language Servers:
+  - PHP: treat `.phtml` files as PHP sources by default (all PHP language servers) #1710
+  - PHP/Intelephense: expose `file_filter` via `ls_specific_settings["php"]`, so that additional
+    extensions containing PHP sources (e.g. Drupal's `.module` / `.install` / `.inc` / `.theme`)
+    become visible to the symbol tools and are indexed by the language server #1710
+  - Fix: an LSP `ContentModified` (-32801) response was surfaced as a hard `SolidLSPException`
+    instead of being retried, as the spec expects for requests a client declared it will reissue.
+    `send_request` now retries such responses for methods declared via a server's
+    `retryOnContentModified` capability; rust-analyzer declares `textDocument/hover`, fixing the
+    flaky `test_find_symbol[rust_add_function]` on windows-latest. #1724
+
+* JetBrains:
+  - Allow external files from dependencies (specified via references like "<ext:FileUtil.class|472e0a13>") to be
+    - read via `ReadFileTool` 
+    - searched via `SearchForPatternTool`
+    - used in `JetBrainsFindDeclarationTool`
+    when using plugin version 2023.3.3+
+
+* Dashboard:
+  - The version display now indicates when a newer Serena version is available
+  - Fix: the "Last Execution" panel stayed on "Loading..." forever when there was no logged execution
+    (e.g. a fresh server / no tool run yet), because `loadLastExecution()` only rendered the panel when
+    the backend returned a non-null execution; the empty state is now rendered via the existing
+    `displayLastExecution(null)` path, mirroring the other panels #1713
+
+* Dependencies:
+  - Bump `mcp` from 1.27.0 to 1.28.1
+  - Bump `anthropic` from 0.59.0 to 0.117.0
+
 # v1.6.0 (2026-07-16)
 
 * General:
@@ -37,7 +152,8 @@ Status of the `main` branch. Changes prior to the next official version change w
   - During project creation, language composition percentages are now computed relative to the total number 
     of recognised source files instead of all files, i.e. unrecognised files are ignored in the percentage 
     computation.
-  - Fix: Use LSP-compliant line splitting ("\n", "\r\n" and "\r" can define line breaks); previously only "\n" considered
+  - Consider all LSP-compliant line endings ("\n", "\r\n" and "\r") in `TextUtils`, noting that 
+    only "\n" appears in files read by `FileUtils.read_file` (Serena's default reading mechanism)
   - Fix: Apply consistent line splitting across tools, uniformly applying the LSP splitting semantics; 
     affects `search_text` used by `search_for_pattern` tool (reported in #1684)
   - Fix in `TextUtils` (used by editors): Deleting up to the end of the file, referencing the line one past 

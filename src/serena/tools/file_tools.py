@@ -16,10 +16,9 @@ from serena.tools import SUCCESS_RESULT, EditedFileContext, EditingToolWithDiagn
 from serena.util.file_system import scan_directory
 from serena.util.text_utils import (
     ContentReplacer,
+    GlobMatcher,
     MultiFileContentReplacer,
     ReplacementOccurrence,
-    expand_braces,
-    glob_match,
 )
 from solidlsp.ls_utils import TextUtils
 
@@ -403,13 +402,13 @@ class ReplaceInFilesTool(EditingToolWithDiagnostics):
                 is_ignored_file=self.project.is_ignored_path,
                 relative_to=self.get_project_root(),
             )
-        include_patterns = expand_braces(paths_include_glob.strip()) if paths_include_glob.strip() else None
-        exclude_patterns = expand_braces(paths_exclude_glob.strip()) if paths_exclude_glob.strip() else None
+        include_glob_matcher = GlobMatcher(paths_include_glob.strip()) if paths_include_glob.strip() else None
+        exclude_glob_matcher = GlobMatcher(paths_exclude_glob.strip()) if paths_exclude_glob.strip() else None
         files: list[tuple[str, str]] = []
         for path in sorted(rel_paths):
-            if include_patterns and not any(glob_match(p, path) for p in include_patterns):
+            if include_glob_matcher and not include_glob_matcher.matches(path):
                 continue
-            if exclude_patterns and any(glob_match(p, path) for p in exclude_patterns):
+            if exclude_glob_matcher and exclude_glob_matcher.matches(path):
                 continue
             try:
                 files.append((path, self.project.read_file(path)))
@@ -646,10 +645,6 @@ class SearchForPatternTool(Tool):
         if relative_path:
             self.project.validate_relative_path(relative_path, require_not_ignored=True)
 
-        abs_path = os.path.join(self.get_project_root(), relative_path)
-        if not os.path.exists(abs_path):
-            raise FileNotFoundError(f"Relative path {relative_path} does not exist.")
-
         matches = self.project.search_project_files_for_pattern(
             pattern=substring_pattern,
             relative_path=relative_path,
@@ -668,15 +663,48 @@ class SearchForPatternTool(Tool):
             file_to_matches[match.source_file_path].append(match.to_display_string())
 
         # capture lightweight match data for shortening before serialization
-        match_lines_by_file: dict[str, list[int]] = defaultdict(list)
+        match_lines_by_file: dict[str, list[dict[str, int | str]]] = defaultdict(list)
         for match in matches:
             assert match.source_file_path is not None
-            match_lines_by_file[match.source_file_path].append(match.matched_lines[0].line_number)
+            first = match.matched_lines[0]
+            match_lines_by_file[match.source_file_path].append({"line": first.line_number, "text": first.line_content.strip()})
 
         # shortened result closures, from least to most aggressive shortening
-        def make_lines_only() -> str:
-            """Match locations without surrounding context"""
-            return f"Match lines per file:\n{self._to_json(match_lines_by_file)}"
+        _TEXT_TRUNCATE = 60
+
+        def render_first_lines(truncate: bool) -> str:
+            """Render each match's first line, either in full or truncated to a fixed length."""
+
+            def entry_text(text: str) -> str:
+                if truncate and len(text) > _TEXT_TRUNCATE:
+                    return text[:_TEXT_TRUNCATE] + "..."
+                return text
+
+            compact = {
+                path: [{"line": m["line"], "text": entry_text(str(m["text"]))} for m in lines]
+                for path, lines in match_lines_by_file.items()
+            }
+            if truncate:
+                header = (
+                    f"Matched lines (text over {_TEXT_TRUNCATE} chars is truncated, marked with a trailing '...'); "
+                    "use read_file with the line numbers for full content:"
+                )
+            else:
+                header = "Matched lines per file; use read_file with the line numbers for surrounding context:"
+            return f"{header}\n{self._to_json(compact)}"
+
+        def make_first_lines_full() -> str:
+            """Match locations with each match's full first line."""
+            return render_first_lines(truncate=False)
+
+        def make_first_lines_truncated() -> str:
+            """Match locations with each match's first line truncated to a fixed length."""
+            return render_first_lines(truncate=True)
+
+        def make_line_numbers_only() -> str:
+            """Match locations as bare line numbers (no text)."""
+            numbers = {path: [m["line"] for m in lines] for path, lines in match_lines_by_file.items()}
+            return f"Match lines per file:\n{self._to_json(numbers)}"
 
         def make_per_file_counts() -> str:
             counts = {path: len(lines) for path, lines in match_lines_by_file.items()}
@@ -687,5 +715,13 @@ class SearchForPatternTool(Tool):
 
         result = self._to_json(file_to_matches)
         return self._limit_length(
-            result, max_answer_chars, shortened_result_factories=[make_lines_only, make_per_file_counts, make_summary]
+            result,
+            max_answer_chars,
+            shortened_result_factories=[
+                make_first_lines_full,
+                make_first_lines_truncated,
+                make_line_numbers_only,
+                make_per_file_counts,
+                make_summary,
+            ],
         )
