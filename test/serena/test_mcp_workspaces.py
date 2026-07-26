@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from serena.harness_state import HarnessStateStore
 from serena.mcp import SerenaMCPFactory
-from serena.mcp_workspaces import WorkspaceMode, WorkspaceNotFoundError, WorkspaceRegistry
+from serena.mcp_workspaces import WorkspaceError, WorkspaceMode, WorkspaceNotFoundError, WorkspaceRegistry
 from serena.tools.tools_base import ToolRegistry
 from serena.tools.workflow_tools import _coding_task_context_path, _goal_state_path, _plan_state_path
 
@@ -54,13 +55,21 @@ def test_workspace_tools_are_exposed_only_in_multi_mode() -> None:
         fixed_project=True,
     )
     multi_factory = SerenaMCPFactory(transport="stdio", context="chatgpt", workspace_mode=WorkspaceMode.MULTI)
+    admin_factory = SerenaMCPFactory(
+        transport="stdio",
+        context="chatgpt",
+        workspace_mode=WorkspaceMode.MULTI,
+        expose_workspace_admin_tools=True,
+    )
 
     assert {"open_workspace", "list_workspaces", "close_workspace"} <= set(tool_names)
     assert single_factory.context.single_project is False
     assert fixed_factory.context.single_project is True
     assert not ({"open_workspace", "list_workspaces", "close_workspace"} & set(single_factory.context.included_optional_tools))
     assert multi_factory.context.single_project is False
-    assert {"open_workspace", "list_workspaces", "close_workspace"} <= set(multi_factory.context.included_optional_tools)
+    assert {"open_workspace", "close_workspace"} <= set(multi_factory.context.included_optional_tools)
+    assert "list_workspaces" not in multi_factory.context.included_optional_tools
+    assert "list_workspaces" in admin_factory.context.included_optional_tools
 
 
 def test_mcp_schema_matches_workspace_mode() -> None:
@@ -141,6 +150,7 @@ def test_chatgpt_harness_ux_is_remote_and_unambiguous() -> None:
     assert "desktop app context" not in system_prompt
     assert "separate code editor window" not in system_prompt
     assert "output_mode" in tools["exec_command"].description
+    assert "MCP schema fingerprint:" in factory.agent.get_current_config_overview()
     write_properties = tools["write_stdin"].parameters["properties"]
     assert "keys" in write_properties
     assert "submit" not in write_properties
@@ -206,10 +216,62 @@ def test_workspace_registry_expires_idle_agents(tmp_path: Path) -> None:
 
 def test_workflow_state_paths_are_workspace_scoped(tmp_path: Path) -> None:
     workspace_id = "abc123"
+    project_root = tmp_path / "project"
+    state_store = HarnessStateStore.create(tmp_path / "state")
 
-    assert _goal_state_path(tmp_path) == tmp_path / ".serena" / "goal_state.json"
-    assert _goal_state_path(tmp_path, workspace_id) == tmp_path / ".serena" / "task-sessions" / workspace_id / "goal_state.json"
-    assert _plan_state_path(tmp_path, workspace_id) == tmp_path / ".serena" / "task-sessions" / workspace_id / "plan_state.json"
-    assert _coding_task_context_path(tmp_path, workspace_id) == (
-        tmp_path / ".serena" / "task-sessions" / workspace_id / "coding_task_context.json"
-    )
+    single_goal_path = _goal_state_path(project_root, state_store=state_store)
+    workspace_goal_path = _goal_state_path(project_root, workspace_id, state_store)
+
+    assert single_goal_path.parent.parent.parent == state_store.root
+    assert single_goal_path.parent.name == "single"
+    assert workspace_goal_path.parent.name == workspace_id
+    assert workspace_goal_path.name == "goal_state.json"
+    assert _plan_state_path(project_root, workspace_id, state_store).name == "plan_state.json"
+    assert _coding_task_context_path(project_root, workspace_id, state_store).name == "coding_task_context.json"
+    assert project_root not in workspace_goal_path.parents
+
+
+def test_workspace_registry_rejects_duplicate_working_tree_by_default(tmp_path: Path) -> None:
+    registry = WorkspaceRegistry(FakeAgent, ttl_seconds=3600)
+    try:
+        registry.open(str(tmp_path))
+
+        with pytest.raises(WorkspaceError, match="separate Git worktree"):
+            registry.open(str(tmp_path))
+    finally:
+        registry.shutdown()
+
+
+def test_workspace_registry_can_explicitly_share_working_tree(tmp_path: Path) -> None:
+    registry = WorkspaceRegistry(FakeAgent, ttl_seconds=3600, allow_shared_worktree=True)
+    try:
+        registry.open(str(tmp_path))
+        registry.open(str(tmp_path))
+
+        assert len(registry.list()) == 2
+    finally:
+        registry.shutdown()
+
+
+def test_workspace_registry_enforces_capacity(tmp_path: Path) -> None:
+    registry = WorkspaceRegistry(FakeAgent, ttl_seconds=3600, max_workspaces=1)
+    try:
+        registry.open(str(tmp_path / "first"))
+
+        with pytest.raises(WorkspaceError, match="Workspace limit reached"):
+            registry.open(str(tmp_path / "second"))
+    finally:
+        registry.shutdown()
+
+
+def test_workspace_registry_rejects_switch_to_another_workspace_tree(tmp_path: Path) -> None:
+    registry = WorkspaceRegistry(FakeAgent, ttl_seconds=3600)
+    try:
+        first = registry.open(str(tmp_path / "first"))
+        second = registry.open(str(tmp_path / "second"))
+
+        with pytest.raises(WorkspaceError, match="separate Git worktree"):
+            registry.assert_project_available(str(second["workspace_id"]), tmp_path / "first")
+        registry.assert_project_available(str(first["workspace_id"]), tmp_path / "first")
+    finally:
+        registry.shutdown()

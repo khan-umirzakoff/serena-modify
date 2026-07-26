@@ -414,6 +414,19 @@ class TestWorkspaceModeValidation:
         assert result.exit_code != 0
         assert "requires --project" in result.output
 
+    @pytest.mark.parametrize(
+        ("arguments", "message"),
+        [
+            (["--workspace-ttl-seconds", "0"], "--workspace-ttl-seconds must be positive"),
+            (["--max-workspaces", "0"], "--max-workspaces must be positive"),
+        ],
+    )
+    def test_workspace_limits_must_be_positive(self, cli_runner, arguments, message):
+        result = cli_runner.invoke(TopLevelCommands.start_mcp_server, arguments)
+
+        assert result.exit_code != 0
+        assert message in result.output
+
     def test_workspace_mode_is_documented(self, cli_runner):
         result = cli_runner.invoke(TopLevelCommands.start_mcp_server, ["--help"])
         normalized_output = " ".join(result.output.split())
@@ -422,6 +435,9 @@ class TestWorkspaceModeValidation:
         assert "--workspace-mode [single|multi]" in result.output
         assert "single uses one shared switchable project" in normalized_output
         assert "--fixed-project" in result.output
+        assert "--state-dir" in result.output
+        assert "--max-workspaces" in result.output
+        assert "--allow-shared-worktree" in result.output
 
 
 if __name__ == "__main__":

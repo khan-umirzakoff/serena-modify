@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from serena.harness_state import HarnessStateStore
 from serena.tools.cmd_tools import (
     SendTerminalSignalTool,
     StopTerminalSessionTool,
@@ -63,15 +64,15 @@ def test_terminal_context_marks_expected_nested_repo(tmp_path: Path) -> None:
     nested_repo = project_root / "app"
     nested_repo.mkdir(parents=True)
     (nested_repo / ".git").mkdir()
-    context_dir = project_root / ".serena"
-    context_dir.mkdir()
-    context_file = context_dir / "coding_task_context.json"
+    state_store = HarnessStateStore.create(tmp_path / "state")
+    context_file = state_store.path(project_root, "coding_task_context.json")
+    context_file.parent.mkdir(parents=True)
     context_file.write_text(
         '{"project_root": "' + str(project_root) + '", "git_root": "' + str(nested_repo) + '"}',
         encoding="utf-8",
     )
 
-    warnings = _terminal_context_warnings(project_root, nested_repo)
+    warnings = _terminal_context_warnings(project_root, nested_repo, state_store=state_store)
 
     assert warnings
     assert "matches the latest prepare_coding_task nested Git root" in warnings[0]
@@ -83,16 +84,16 @@ def test_terminal_context_ignores_mismatched_expected_repo_context(tmp_path: Pat
     nested_repo = project_root / "app"
     nested_repo.mkdir(parents=True)
     (nested_repo / ".git").mkdir()
-    context_dir = project_root / ".serena"
-    context_dir.mkdir()
-    context_file = context_dir / "coding_task_context.json"
+    state_store = HarnessStateStore.create(tmp_path / "state")
+    context_file = state_store.path(project_root, "coding_task_context.json")
+    context_file.parent.mkdir(parents=True)
     other_project = tmp_path / "other"
     context_file.write_text(
         '{"project_root": "' + str(other_project) + '", "git_root": "' + str(nested_repo) + '"}',
         encoding="utf-8",
     )
 
-    warnings = _terminal_context_warnings(project_root, nested_repo)
+    warnings = _terminal_context_warnings(project_root, nested_repo, state_store=state_store)
 
     assert warnings
     assert "active Serena project is different" in warnings[0]

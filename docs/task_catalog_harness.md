@@ -29,6 +29,7 @@ Supported manifests in v1:
 - `Gemfile`
 - `CMakeLists.txt`
 - `*.csproj`
+- `pubspec.yaml` for Dart and Flutter
 
 The engine also reads `.serena/tasks.json` for explicit project overrides.
 
@@ -64,15 +65,15 @@ Task IDs include runner information to avoid collisions, for example:
 - `run_validation(validation_id, relative_path=".", files=[...])` selects and runs validation; `files` narrows safe known runners such as `ruff check`, `ruff format`, and `pytest`.
 - `get_validation_commands(relative_path=".")` stays as a backward-compatible public-only wrapper around the catalog's validation hints.
 - `prepare_coding_task` includes `task_catalog_summary`, compact `edit_policy`, and only a small public top-task list by default.
-- `prepare_coding_task` loads global and scoped `AGENTS` guidance in Codex order, honors `project_doc_fallback_filenames`
-  and `project_doc_max_bytes`, and skips empty override files before trying lower-precedence names.
+- `prepare_coding_task` loads global and scoped `AGENTS` guidance in Codex order from the nearest Git root to the task focus,
+  honors `project_doc_fallback_filenames` and `project_doc_max_bytes`, and skips empty override files before trying lower-precedence names.
 - Edit policy is explicit: inspect unfamiliar code first, use semantic tools for symbol-aware changes, use `replace_content` for exact small edits with `allow_multiple_occurrences=false`, and reserve `apply_patch` for atomic multi-file or structured textual patches.
 - Scoped task lookup is supported through `relative_path`, so multi-repo workspaces can target `frontend`, `backend`, or a nested package without scanning/running unrelated tasks.
 - `prepare_coding_task(relative_path=...)` and `finalize_coding_task(relative_path=...)` resolve Git status/diff from the nearest nested Git root under the active Serena project, so workspace folders with subrepos report the correct repo state. `prepare_coding_task` also stores the latest focus, letting a short `finalize_coding_task()` call keep the same subrepo context.
 - `.serena/tasks.json` v2 metadata is preserved for custom tasks: `id`, `kind`, `command`, `workdir`, `interactive`, `long_running`, `ready_pattern`, `problem_matcher`, `depends_on`, and `depends_order`.
 - Compound `depends_on` tasks execute automatically when `depends_order` is `sequence`; parallel and nested compound tasks still fail closed.
 - Long-running task responses include service readiness metadata when a task defines `ready_pattern`.
-- Validation responses include compact parsed diagnostics for common `ruff` and `pytest` output.
+- Validation responses include compact parsed diagnostics for common `ruff`, `pytest`, Dart, and Flutter output.
 - Terminal control is structured: use `exec_command(tty=true)` for interactive commands, `write_stdin` for prompt input, `terminal_status` for non-consuming session status/output inspection, and `send_terminal_signal` for SIGINT/SIGTERM/SIGKILL.
 - Terminal `workdir` and Serena active project are separate contexts. If `exec_command` runs inside a nested Git repository or outside the active project root, the terminal response includes a warning telling the agent to call `activate_project(...)` when semantic tools should follow that repo.
 

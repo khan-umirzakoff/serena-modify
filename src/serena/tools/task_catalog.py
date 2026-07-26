@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 ALWAYS_SKIPPED_DIRS = {
     ".git",
 }
@@ -72,6 +74,7 @@ MANIFEST_NAMES = {
     "composer.json",
     "Gemfile",
     "CMakeLists.txt",
+    "pubspec.yaml",
 }
 
 VALIDATION_KINDS = {"build", "check", "format", "lint", "test", "typecheck", "verify"}
@@ -408,6 +411,8 @@ def _tasks_from_manifest(project_root: Path, manifest: Path, managers: list[str]
         return _tasks_from_cargo(project_root, manifest, managers)
     if manifest.name == "go.mod":
         return _tasks_from_go(project_root, manifest, managers)
+    if manifest.name == "pubspec.yaml":
+        return _tasks_from_pubspec(project_root, manifest, managers)
     if manifest.name in {"Makefile", "makefile", "GNUmakefile"}:
         return _tasks_from_makefile(project_root, manifest, managers)
     if manifest.name in {"justfile", "Justfile", ".justfile"}:
@@ -589,6 +594,83 @@ def _tasks_from_go(project_root: Path, manifest: Path, managers: list[str]) -> l
             "medium",
         ),
     ]
+
+
+def _tasks_from_pubspec(project_root: Path, manifest: Path, managers: list[str]) -> list[ProjectTask]:
+    """Tasks inferred from Dart and Flutter package metadata."""
+    data = _read_yaml_file(manifest)
+    dependencies = data.get("dependencies", {})
+    flutter_dependency = dependencies.get("flutter") if isinstance(dependencies, dict) else None
+    is_flutter = "flutter" in data or isinstance(flutter_dependency, dict)
+    runner = "flutter" if is_flutter else "dart"
+    _append_unique(managers, runner)
+    relative = _relative_path(manifest, project_root)
+
+    tasks = [
+        _task(
+            project_root,
+            manifest.parent,
+            "analyze",
+            "check",
+            runner,
+            f"{runner} analyze",
+            f"{relative}:builtin.analyze",
+            "high",
+        ),
+        _task(
+            project_root,
+            manifest.parent,
+            "test",
+            "test",
+            runner,
+            f"{runner} test",
+            f"{relative}:builtin.test",
+            "high",
+        ),
+        _task(
+            project_root,
+            manifest.parent,
+            "format-check",
+            "format",
+            "dart",
+            "dart format --output=none --set-exit-if-changed .",
+            f"{relative}:builtin.format",
+            "medium",
+        ),
+        _task(
+            project_root,
+            manifest.parent,
+            "pub-get",
+            "task",
+            runner,
+            f"{runner} pub get",
+            f"{relative}:builtin.pub-get",
+            "medium",
+        ),
+    ]
+    if not is_flutter:
+        return tasks
+
+    build_targets = {
+        "android": ("build-apk-debug", "flutter build apk --debug"),
+        "web": ("build-web", "flutter build web"),
+        "linux": ("build-linux-debug", "flutter build linux --debug"),
+    }
+    for directory_name, (name, command) in build_targets.items():
+        if (manifest.parent / directory_name).is_dir():
+            tasks.append(
+                _task(
+                    project_root,
+                    manifest.parent,
+                    name,
+                    "build",
+                    "flutter",
+                    command,
+                    f"{relative}:builtin.{name}",
+                    "medium",
+                )
+            )
+    return tasks
 
 
 def _tasks_from_makefile(project_root: Path, manifest: Path, managers: list[str]) -> list[ProjectTask]:
@@ -919,6 +1001,15 @@ def _read_toml_file(path: Path) -> dict[str, Any]:
         return tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):
         return {}
+
+
+def _read_yaml_file(path: Path) -> dict[str, Any]:
+    """YAML object read from a file, returning an empty object on parse errors."""
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _read_text_lines(path: Path) -> list[str]:

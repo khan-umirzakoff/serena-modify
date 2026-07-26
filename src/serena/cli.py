@@ -251,6 +251,38 @@ class TopLevelCommands(AutoRegisteringGroup):
         help="Lock single mode to the startup project and hide project activation.",
     )
     @click.option(
+        "--state-dir",
+        type=click.Path(file_okay=False, path_type=str),
+        default=None,
+        help="External directory for coding-harness goal, plan, and task-context runtime state.",
+    )
+    @click.option(
+        "--workspace-ttl-seconds",
+        type=float,
+        default=6 * 60 * 60,
+        show_default=True,
+        help="Idle lifetime for multi-workspace agents.",
+    )
+    @click.option(
+        "--max-workspaces",
+        type=int,
+        default=8,
+        show_default=True,
+        help="Maximum number of active multi-workspace agents.",
+    )
+    @click.option(
+        "--allow-shared-worktree",
+        is_flag=True,
+        default=False,
+        help="Allow parallel workspaces to edit the same filesystem working tree.",
+    )
+    @click.option(
+        "--workspace-admin-tools",
+        is_flag=True,
+        default=False,
+        help="Expose global workspace listing for server administration.",
+    )
+    @click.option(
         "--mode",
         "default_modes",
         type=str,
@@ -335,6 +367,11 @@ class TopLevelCommands(AutoRegisteringGroup):
         context: str,
         workspace_mode: str,
         fixed_project: bool,
+        state_dir: str | None,
+        workspace_ttl_seconds: float,
+        max_workspaces: int,
+        allow_shared_worktree: bool,
+        workspace_admin_tools: bool,
         default_modes: Sequence[str],
         added_modes: Sequence[str],
         language_backend: str | None,
@@ -392,6 +429,10 @@ class TopLevelCommands(AutoRegisteringGroup):
             raise click.UsageError("--workspace-mode single with --context chatgpt requires --project")
         if fixed_project and project_file is None:
             raise click.UsageError("--fixed-project requires --project")
+        if workspace_ttl_seconds <= 0:
+            raise click.UsageError("--workspace-ttl-seconds must be positive")
+        if max_workspaces <= 0:
+            raise click.UsageError("--max-workspaces must be positive")
 
         mode_selection_def: ModeSelectionDefinition | None = None
         if default_modes or added_modes:
@@ -404,6 +445,11 @@ class TopLevelCommands(AutoRegisteringGroup):
             memory_log_handler=memory_log_handler,
             workspace_mode=parsed_workspace_mode,
             fixed_project=fixed_project,
+            harness_state_dir=state_dir,
+            workspace_ttl_seconds=workspace_ttl_seconds,
+            max_workspaces=max_workspaces,
+            allow_shared_worktree=allow_shared_worktree,
+            expose_workspace_admin_tools=workspace_admin_tools,
         )
         server = factory.create_mcp_server(
             host=host,

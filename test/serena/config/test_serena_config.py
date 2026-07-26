@@ -174,7 +174,7 @@ class TestProjectConfig:
             config = ProjectConfig.load(project_root, serena_config=serena_config)
 
             assert config.project_name == "compact"
-            assert config.languages == [Language.PYTHON]
+            assert config.language_servers == [LanguageServerId.PYTHON]
             assert config.encoding
             assert project_yml.read_text(encoding="utf-8") == original_content
         finally:

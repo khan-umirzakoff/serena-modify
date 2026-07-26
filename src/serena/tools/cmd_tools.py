@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal, cast
 
+from serena.harness_state import HarnessStateStore
 from serena.tools import Tool, ToolMarkerCanEdit
 from serena.tools.terminal_screen import TerminalDimensions, TerminalKey, TerminalScreen, TerminalScreenSnapshot
 from solidlsp.util.subprocess_util import subprocess_kwargs, terminate_process_tree_with_kill_fallback
@@ -702,14 +703,15 @@ def _resolve_workdir(project_root: str, workdir: str | None) -> Path:
     return resolved
 
 
-def _load_expected_coding_git_root(project_root: Path, workspace_id: str | None = None) -> Path | None:
+def _load_expected_coding_git_root(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> Path | None:
     """
     Return a fresh coding-task Git root recorded by ``prepare_coding_task``.
     """
-    context_dir = project_root / ".serena"
-    if workspace_id is not None:
-        context_dir = context_dir / "task-sessions" / workspace_id
-    context_path = context_dir / "coding_task_context.json"
+    context_path = (state_store or HarnessStateStore.create()).path(project_root, "coding_task_context.json", workspace_id)
     if not context_path.is_file():
         return None
     try:
@@ -746,7 +748,12 @@ def _find_enclosing_git_root(path: Path) -> Path | None:
     return None
 
 
-def _terminal_context_warnings(project_root: Path, workdir: Path, workspace_id: str | None = None) -> list[str]:
+def _terminal_context_warnings(
+    project_root: Path,
+    workdir: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> list[str]:
     """
     Return warnings for terminal context that differs from Serena's active project.
     """
@@ -767,7 +774,7 @@ def _terminal_context_warnings(project_root: Path, workdir: Path, workspace_id: 
     workdir_git_root = _find_enclosing_git_root(workdir)
     if workdir_git_root is not None and workdir_git_root.resolve() != project_root:
         resolved_workdir_git_root = workdir_git_root.resolve()
-        expected_git_root = _load_expected_coding_git_root(project_root, workspace_id)
+        expected_git_root = _load_expected_coding_git_root(project_root, workspace_id, state_store)
         if expected_git_root == resolved_workdir_git_root:
             warnings.append(
                 "Terminal workdir matches the latest prepare_coding_task nested Git root. "
@@ -790,11 +797,12 @@ def _with_context_warnings(
     project_root: Path,
     workdir: Path,
     workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
 ) -> TerminalResponse:
     """
     Return a terminal response annotated with project/workdir context warnings.
     """
-    warnings = [*response.warnings, *_terminal_context_warnings(project_root, workdir, workspace_id)]
+    warnings = [*response.warnings, *_terminal_context_warnings(project_root, workdir, workspace_id, state_store)]
     if not warnings:
         return response
     return replace(response, warnings=warnings)
@@ -831,7 +839,13 @@ class ExecuteShellCommandTool(Tool, ToolMarkerCanEdit):
         workdir = _resolve_workdir(str(project_root), cwd)
         yield_time_ms = MIN_YIELD_TIME_MS if background else _bounded(timeout_seconds * 1000, MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
         response = self.agent.get_terminal_process_manager().exec_command(command=command, cwd=workdir, yield_time_ms=yield_time_ms)
-        response = _with_context_warnings(response, project_root, workdir, self.agent.get_workspace_id())
+        response = _with_context_warnings(
+            response,
+            project_root,
+            workdir,
+            self.agent.get_workspace_id(),
+            self.agent.get_harness_state_store(),
+        )
         return self._limit_length(_json_response(response), max_answer_chars)
 
 
@@ -881,7 +895,13 @@ class ExecCommandTool(Tool, ToolMarkerCanEdit):
             rows=rows,
             columns=columns,
         )
-        response = _with_context_warnings(response, project_root, workdir_path, self.agent.get_workspace_id())
+        response = _with_context_warnings(
+            response,
+            project_root,
+            workdir_path,
+            self.agent.get_workspace_id(),
+            self.agent.get_harness_state_store(),
+        )
         return _json_response(response)
 
 

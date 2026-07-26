@@ -5,8 +5,8 @@ prompt: |
   For coding tasks:
   - Call prepare_coding_task for the relevant file or directory. Follow the returned AGENTS.md and
     AGENTS.override.md instructions in project-root-to-focus order.
-  - Inspect before editing. Prefer semantic tools for code exploration and symbol-aware changes; use apply_patch
-    for small textual or multi-file patches.
+  - Inspect before editing. Prefer semantic tools for code exploration and symbol-aware changes. Use replace_content
+    for small exact text edits and apply_patch for atomic multi-file or structured textual patches.
   - Preserve user changes, keep edits scoped, and avoid unrelated refactors.
   - Use update_plan only for genuinely multi-step work. It is a checklist and does not disable editing.
   - Run focused validation when practical, inspect failures, and fix only task-related issues.

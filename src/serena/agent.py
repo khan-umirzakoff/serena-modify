@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from logging import Logger
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional, TypeVar
 
 import requests
@@ -41,6 +42,7 @@ from serena.config.serena_config import (
     ToolInclusionDefinition,
 )
 from serena.dashboard import SerenaDashboardAPI, SerenaDashboardTrayManager, SerenaDashboardViewer, open_url_in_browser
+from serena.harness_state import HarnessStateStore
 from serena.jetbrains import jetbrains_plugin_client
 from serena.ls_manager import LanguageServerManager
 from serena.memories.memory_manager import MemoryManager
@@ -549,6 +551,7 @@ class SerenaAgent:
         memory_log_handler: MemoryLogHandler | None = None,
         workspace_id: str | None = None,
         workspace_registry: "WorkspaceRegistry | None" = None,
+        harness_state_dir: Path | str | None = None,
     ):
         """
         :param project: the project to load immediately or None to not load any project; may be a path to the project or a name of
@@ -562,12 +565,15 @@ class SerenaAgent:
             if necessary.
         :param workspace_id: explicit shared-MCP workspace identifier, or None for the legacy global agent.
         :param workspace_registry: shared-MCP workspace registry available to workspace-management tools.
+        :param harness_state_dir: optional external root for goal, plan, and task-context runtime state.
         """
         from serena.tools.cmd_tools import TerminalProcessManager
 
         self._active_project: Project | None = None
         self._workspace_id = workspace_id
         self._workspace_registry = workspace_registry
+        self._harness_state_store = HarnessStateStore.create(harness_state_dir)
+        self._mcp_schema_fingerprint: str | None = None
         self._terminal_process_manager = TerminalProcessManager()
         self._project_activation_callback = project_activation_callback
         self._gui_log_viewer: Optional["GuiLogViewer"] = None
@@ -864,6 +870,14 @@ class SerenaAgent:
     def get_workspace_id(self) -> str | None:
         """Return the explicit shared-MCP workspace identifier for this agent."""
         return self._workspace_id
+
+    def get_harness_state_store(self) -> HarnessStateStore:
+        """Return the external coding-harness runtime-state store."""
+        return self._harness_state_store
+
+    def set_mcp_schema_fingerprint(self, fingerprint: str) -> None:
+        """Record the public MCP tool-schema fingerprint for diagnostics."""
+        self._mcp_schema_fingerprint = fingerprint
 
     def set_workspace_registry(self, workspace_registry: "WorkspaceRegistry") -> None:
         """Attach the shared-MCP workspace registry used by management tools."""
@@ -1197,6 +1211,9 @@ class SerenaAgent:
         if self._active_project is not None and self._active_project.project_root == project.project_root:
             return False
 
+        if self._workspace_registry is not None and self._workspace_id is not None:
+            self._workspace_registry.assert_project_available(self._workspace_id, project.project_root)
+
         log.info(f"Activating {project.project_name} at {project.project_root}")
 
         # check if the project requires a different language backend than the one initialized at startup
@@ -1366,6 +1383,8 @@ class SerenaAgent:
         """
         result_str = "Current configuration:\n"
         result_str += f"Serena version: {self.version}\n"
+        if self._mcp_schema_fingerprint is not None:
+            result_str += f"MCP schema fingerprint: {self._mcp_schema_fingerprint}\n"
         result_str += f"Loglevel: {self.serena_config.log_level}, trace_lsp_communication={self.serena_config.trace_lsp_communication}\n"
         if self._active_project is not None:
             result_str += f"Active project: {self._active_project.project_name}\n"
@@ -1450,16 +1469,19 @@ class SerenaAgent:
         terminal_process_manager = getattr(self, "_terminal_process_manager", None)
         if terminal_process_manager is not None:
             terminal_process_manager.shutdown()
-        if self._active_project is not None:
-            log.info(f"Shutting down active project '{self._active_project.project_name}' ...")
-            self._active_project.shutdown(timeout=timeout)
+        active_project = getattr(self, "_active_project", None)
+        if active_project is not None:
+            log.info(f"Shutting down active project '{active_project.project_name}' ...")
+            active_project.shutdown(timeout=timeout)
             self._active_project = None
-        if self._gui_log_viewer:
+        gui_log_viewer = getattr(self, "_gui_log_viewer", None)
+        if gui_log_viewer is not None:
             log.info("Stopping the GUI log window ...")
-            self._gui_log_viewer.stop()
+            gui_log_viewer.stop()
             self._gui_log_viewer = None
-        if self._dashboard_manager:
-            self._dashboard_manager.shutdown()
+        dashboard_manager = getattr(self, "_dashboard_manager", None)
+        if dashboard_manager is not None:
+            dashboard_manager.shutdown()
             self._dashboard_manager = None
 
     def shutdown(self) -> None:

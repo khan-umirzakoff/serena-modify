@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from serena.harness_state import HarnessStateStore
 from serena.tools.task_catalog import discover_task_catalog
 from serena.tools.tools_base import ToolRegistry
 from serena.tools.workflow_tools import (
@@ -240,6 +241,26 @@ def test_discover_task_catalog_supports_broad_manifests(tmp_path: Path) -> None:
     assert "make" in catalog.detected_package_managers
 
 
+def test_discover_task_catalog_supports_flutter_and_dart(tmp_path: Path) -> None:
+    flutter_project = tmp_path / "apps" / "mobile"
+    dart_project = tmp_path / "packages" / "core"
+    (flutter_project / "android").mkdir(parents=True)
+    (flutter_project / "web").mkdir()
+    dart_project.mkdir(parents=True)
+    (flutter_project / "pubspec.yaml").write_text(
+        "name: mobile\ndependencies:\n  flutter:\n    sdk: flutter\nflutter:\n  uses-material-design: true\n",
+        encoding="utf-8",
+    )
+    (dart_project / "pubspec.yaml").write_text("name: core\ndev_dependencies:\n  test: any\n", encoding="utf-8")
+
+    catalog = discover_task_catalog(tmp_path)
+    commands = {task.command for task in catalog.tasks}
+
+    assert {"flutter analyze", "flutter test", "flutter build apk --debug", "flutter build web"} <= commands
+    assert {"dart analyze", "dart test", "dart format --output=none --set-exit-if-changed ."} <= commands
+    assert {"flutter", "dart"} <= set(catalog.detected_package_managers)
+
+
 def test_task_catalog_filtered_view_hides_internal_tasks_and_prefers_root_tasks(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text("[tool.poe.tasks]\n_hidden = 'echo hidden'\nlint = 'echo lint'\n", encoding="utf-8")
     nested = tmp_path / "test" / "resources" / "repos" / "rust"
@@ -364,6 +385,7 @@ def test_goal_objective_validation_matches_codex_limits() -> None:
 
 
 def test_goal_public_state_and_response_include_remaining_budget(tmp_path: Path) -> None:
+    state_store = HarnessStateStore.create(tmp_path / "state")
     _save_goal_state(
         tmp_path,
         {
@@ -376,11 +398,12 @@ def test_goal_public_state_and_response_include_remaining_budget(tmp_path: Path)
             "updated_at": "2026-06-24T00:00:00Z",
             "progress": [],
         },
+        state_store=state_store,
     )
 
-    public = _goal_public_state(tmp_path)
+    public = _goal_public_state(tmp_path, state_store=state_store)
     assert public is not None
-    assert public["state_path"] == str(_goal_state_path(tmp_path))
+    assert public["state_path"] == str(_goal_state_path(tmp_path, state_store=state_store))
     assert public["remaining_tokens"] == 75
 
     response = _goal_response(public, include_completion_report=True)
@@ -656,6 +679,7 @@ def test_apply_patch_dry_run_multifile_does_not_write(tmp_path: Path) -> None:
 
 
 def test_coding_task_context_round_trips_latest_focus(tmp_path: Path) -> None:
+    state_store = HarnessStateStore.create(tmp_path / "state")
     state = {
         "project_root": str(tmp_path),
         "active_project_name": "workspace",
@@ -663,9 +687,9 @@ def test_coding_task_context_round_trips_latest_focus(tmp_path: Path) -> None:
         "git_root": str(tmp_path / "crm-frontend"),
     }
 
-    _save_coding_task_context(tmp_path, state)
+    _save_coding_task_context(tmp_path, state, state_store=state_store)
 
-    assert _load_coding_task_context(tmp_path) == state
+    assert _load_coding_task_context(tmp_path, state_store=state_store) == state
 
 
 def test_resolve_git_root_prefers_nested_repo(tmp_path: Path) -> None:
@@ -678,6 +702,28 @@ def test_resolve_git_root_prefers_nested_repo(tmp_path: Path) -> None:
     subprocess.run(["git", "init"], cwd=subrepo, check=True, capture_output=True, text=True)
 
     assert _resolve_git_root(workspace, subrepo) == subrepo.resolve()
+
+
+def test_nested_git_root_scopes_agents_documents(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    subrepo = workspace / "crm-frontend"
+    focus = subrepo / "src"
+    focus.mkdir(parents=True)
+    (workspace / "AGENTS.md").write_text("outer workspace instructions", encoding="utf-8")
+    (subrepo / "AGENTS.md").write_text("nested repo instructions", encoding="utf-8")
+
+    import subprocess
+
+    subprocess.run(["git", "init"], cwd=subrepo, check=True, capture_output=True, text=True)
+    instruction_root = _resolve_git_root(workspace, focus)
+    documents = _load_instruction_documents(
+        project_root=instruction_root,
+        focus_dir=focus,
+        max_total_bytes=32 * 1024,
+        settings=ProjectInstructionSettings(codex_home=tmp_path / "codex-home", fallback_filenames=(), max_bytes=32 * 1024),
+    )
+
+    assert [document.contents for document in documents] == ["nested repo instructions"]
 
 
 def test_resolve_git_root_falls_back_to_workspace_without_repo(tmp_path: Path) -> None:
@@ -703,6 +749,27 @@ def test_validation_diagnostics_parser_extracts_ruff_and_pytest() -> None:
     assert diagnostics[0] == {"path": "src/demo.py", "line": 10, "column": 5, "message": "F401 unused import"}
     assert diagnostics[1]["tool"] == "pytest"
     assert diagnostics[1]["path"] == "test/test_demo.py::test_demo"
+
+
+def test_validation_diagnostics_parser_extracts_flutter_and_dart() -> None:
+    diagnostics = _parse_validation_diagnostics(
+        "  error • Undefined name 'missing' • lib/main.dart:12:7 • undefined_identifier\n"
+        "WARNING|STATIC_WARNING|UNUSED_IMPORT|lib/core.dart|3|1|8|Unused import\n"
+        "warning - test/widget_test.dart:8:4 - Unused local variable - unused_local_variable"
+    )
+
+    assert diagnostics[0] == {
+        "tool": "flutter",
+        "severity": "error",
+        "path": "lib/main.dart",
+        "line": 12,
+        "column": 7,
+        "code": "undefined_identifier",
+        "message": "Undefined name 'missing'",
+    }
+    assert diagnostics[1]["tool"] == "dart"
+    assert diagnostics[1]["path"] == "lib/core.dart"
+    assert diagnostics[2]["code"] == "unused_local_variable"
 
 
 def test_task_service_status_uses_ready_pattern() -> None:

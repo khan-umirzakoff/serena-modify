@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 
 from serena.tools import Tool
-from serena.tools.tools_base import ToolRegistry
+from serena.util.project_scope import resolve_git_scope_root
 
 SKILLS_FILENAME = "SKILL.md"
 SKILL_METADATA_PATH = Path("agents") / "openai.yaml"
@@ -509,6 +509,7 @@ def render_skills_summary(skills: list[SkillMetadata], max_chars: int = DEFAULT_
         "A skill is a task-specific local instruction package stored in a SKILL.md file.",
         "Only skill name, description, policy, resources, dependencies, and file path are listed here.",
         "Do not follow a skill until you first call read_skill for its name or SKILL.md path.",
+        "Skills with implicit=false are explicit-only: do not select them from task matching alone.",
         "",
         "### Available skills",
     ]
@@ -562,10 +563,6 @@ def _truncate_text(text: str, max_answer_chars: int) -> str:
     return text[: max(0, max_answer_chars - 80)].rstrip() + "\n...\n[truncated]"
 
 
-def _active_tool_names() -> set[str]:
-    return set(ToolRegistry().get_tool_names())
-
-
 class DiscoverSkillsTool(Tool):
     """Discovers Codex-compatible skills without loading full SKILL.md instructions."""
 
@@ -579,11 +576,13 @@ class DiscoverSkillsTool(Tool):
         """
         project_root = Path(self.get_project_root()).resolve()
         focus_dir = _resolve_focus_dir(project_root, relative_path)
-        outcome = discover_skills(project_root, focus_dir)
+        skill_scope_root = resolve_git_scope_root(project_root, focus_dir)
+        outcome = discover_skills(skill_scope_root, focus_dir)
         skills = outcome.skills[: max(0, max_skills)]
-        available_tools = _active_tool_names()
+        available_tools = set(self.agent.get_active_tool_names())
         response = {
             "project_root": str(project_root),
+            "skill_scope_root": str(skill_scope_root),
             "focus_dir": str(focus_dir),
             "skills": [skill.to_public_dict() for skill in skills],
             "dependency_report": skill_dependency_reports(skills, available_tools),
@@ -598,18 +597,26 @@ class DiscoverSkillsTool(Tool):
 class ReadSkillTool(Tool):
     """Reads the full SKILL.md instructions for one discovered Codex-compatible skill."""
 
-    def apply(self, skill: str, relative_path: str = ".", max_answer_chars: int = 50000) -> str:
+    def apply(
+        self,
+        skill: str,
+        relative_path: str = ".",
+        max_answer_chars: int = 50000,
+        explicit_invocation: bool = False,
+    ) -> str:
         """
         Return full SKILL.md instructions for a skill name or SKILL.md path.
 
         :param skill: exact skill name or project/absolute path to a SKILL.md file
         :param relative_path: project-relative file or directory used to choose scoped repo skills when resolving by name
         :param max_answer_chars: maximum response length; ``-1`` disables truncation
+        :param explicit_invocation: true only when the user explicitly named or selected this skill
         :return: JSON skill instructions with metadata and contents
         """
         project_root = Path(self.get_project_root()).resolve()
         focus_dir = _resolve_focus_dir(project_root, relative_path)
-        outcome = discover_skills(project_root, focus_dir)
+        skill_scope_root = resolve_git_scope_root(project_root, focus_dir)
+        outcome = discover_skills(skill_scope_root, focus_dir)
         selected: SkillMetadata | None = None
         skill_path = Path(skill).expanduser()
         if skill_path.is_absolute() or skill.endswith(SKILLS_FILENAME) or "/" in skill or "\\" in skill:
@@ -636,8 +643,15 @@ class ReadSkillTool(Tool):
             return _json_response(
                 {"error": f"skill not found: {skill}", "available_skills": [item.to_public_dict() for item in outcome.skills]}
             )
+        if not selected.policy.allow_implicit_invocation and not explicit_invocation:
+            return _json_response(
+                {
+                    "error": f"skill requires explicit invocation: {selected.name}",
+                    "usage": "Retry with explicit_invocation=true only when the user explicitly named or selected this skill.",
+                }
+            )
         contents = Path(selected.path_to_skill_md).read_text(encoding="utf-8")
-        available_tools = _active_tool_names()
+        available_tools = set(self.agent.get_active_tool_names())
         response = {
             "skill": selected.to_public_dict(),
             "dependency_report": skill_dependency_reports([selected], available_tools).get(selected.name, {}),

@@ -1,2 +1,6 @@
 /cache
 /project.local.yml
+/coding_task_context.json
+/goal_state.json
+/plan_state.json
+/task-sessions

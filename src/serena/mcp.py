@@ -2,6 +2,8 @@
 The Serena Model Context Protocol (MCP) Server
 """
 
+import hashlib
+import json
 import sys
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
@@ -28,7 +30,7 @@ from serena.agent import (
 from serena.config.context_mode import SerenaAgentContext
 from serena.config.serena_config import LanguageBackend, ModeSelectionDefinition
 from serena.constants import DEFAULT_CONTEXT, SERENA_LOG_FORMAT
-from serena.mcp_workspaces import WorkspaceError, WorkspaceMode, WorkspaceRegistry
+from serena.mcp_workspaces import DEFAULT_MAX_WORKSPACES, DEFAULT_WORKSPACE_TTL_SECONDS, WorkspaceError, WorkspaceMode, WorkspaceRegistry
 from serena.tools import Tool, ToolCallError
 from serena.util.exception import show_fatal_exception_safe
 from serena.util.logging import MemoryLogHandler
@@ -37,13 +39,15 @@ log = logging.getLogger(__name__)
 
 _workspace_id_context: ContextVar[str | None] = ContextVar("serena_workspace_id", default=None)
 WORKSPACE_MANAGEMENT_TOOLS = {"open_workspace", "list_workspaces", "close_workspace"}
+WORKSPACE_CLIENT_TOOLS = {"open_workspace", "close_workspace"}
+WORKSPACE_ADMIN_TOOLS = {"list_workspaces"}
 MULTI_WORKSPACE_INSTRUCTIONS = """
 This server is running in multi-workspace mode. At the start of each new chat or independent task, call
 open_workspace with the relevant project path or registered project name. Keep the returned workspace_id private
 to that chat and pass it to every subsequent Serena tool call. Never reuse another chat's workspace_id. If it
 expires, call open_workspace again. Within one chat, activate_project may switch that isolated workspace sequentially;
-use separate workspaces for independent or parallel project work. Call close_workspace when the task is finished and
-the workspace is no longer needed.
+use separate workspaces for independent or parallel project work. Parallel edits to the same repository require separate
+Git worktree paths; shared working trees are rejected by default. Call close_workspace when the task is finished.
 """.strip()
 SINGLE_WORKSPACE_INSTRUCTIONS = """
 This server is running in single-workspace mode. The startup project is the initial active project, not a permanent lock.
@@ -225,6 +229,11 @@ class SerenaMCPFactory:
         memory_log_handler: MemoryLogHandler | None = None,
         workspace_mode: WorkspaceMode = WorkspaceMode.SINGLE,
         fixed_project: bool = False,
+        harness_state_dir: str | None = None,
+        workspace_ttl_seconds: float = DEFAULT_WORKSPACE_TTL_SECONDS,
+        max_workspaces: int = DEFAULT_MAX_WORKSPACES,
+        allow_shared_worktree: bool = False,
+        expose_workspace_admin_tools: bool = False,
     ):
         """
         :param transport: The transport to use for the MCP server.
@@ -236,17 +245,28 @@ class SerenaMCPFactory:
         :param workspace_mode: project-routing mode. Single mode uses one shared active project that may switch;
             multi mode exposes explicit workspace management and per-call routing.
         :param fixed_project: whether to lock single mode to the startup project and hide project activation
+        :param harness_state_dir: optional external root for coding-harness runtime state
+        :param workspace_ttl_seconds: multi-workspace inactivity TTL in seconds
+        :param max_workspaces: maximum number of active multi-workspace agents
+        :param allow_shared_worktree: whether parallel workspaces may edit the same filesystem working tree
+        :param expose_workspace_admin_tools: whether global workspace listing is exposed to normal MCP clients
         """
         self.transport = transport
         self.context = SerenaAgentContext.load(context)
         self.workspace_mode = workspace_mode
         self.fixed_project = fixed_project
+        self.harness_state_dir = harness_state_dir
+        self.workspace_ttl_seconds = workspace_ttl_seconds
+        self.max_workspaces = max_workspaces
+        self.allow_shared_worktree = allow_shared_worktree
+        self.expose_workspace_admin_tools = expose_workspace_admin_tools
         self.project = project
         self.agent: SerenaAgent | None = None
         self.memory_log_handler = memory_log_handler
         self._workspace_registry: WorkspaceRegistry | None = None
         self._agent_config: SerenaConfig | None = None
         self._mode_selection_def: ModeSelectionDefinition | None = None
+        self._mcp_schema_fingerprint: str | None = None
 
         # align project switching and optional workspace tools with the selected routing mode
         if workspace_mode.is_multi and fixed_project:
@@ -257,7 +277,11 @@ class SerenaMCPFactory:
             self.context.single_project = True
         included_optional_tools = set(self.context.included_optional_tools)
         if workspace_mode.is_multi:
-            included_optional_tools.update(WORKSPACE_MANAGEMENT_TOOLS)
+            included_optional_tools.update(WORKSPACE_CLIENT_TOOLS)
+            if expose_workspace_admin_tools:
+                included_optional_tools.update(WORKSPACE_ADMIN_TOOLS)
+            else:
+                included_optional_tools.difference_update(WORKSPACE_ADMIN_TOOLS)
         else:
             included_optional_tools.difference_update(WORKSPACE_MANAGEMENT_TOOLS)
         self.context.included_optional_tools = tuple(sorted(included_optional_tools))
@@ -428,11 +452,29 @@ class SerenaMCPFactory:
                     workspace_routing=self.workspace_mode.is_multi and tool.get_name() not in WORKSPACE_MANAGEMENT_TOOLS,
                 )
                 mcp._tool_manager._tools[tool.get_name()] = mcp_tool
+            schema_payload = [
+                {
+                    "name": name,
+                    "description": mcp_tool.description,
+                    "parameters": mcp_tool.parameters,
+                }
+                for name, mcp_tool in sorted(mcp._tool_manager._tools.items())
+            ]
+            self._mcp_schema_fingerprint = hashlib.sha256(
+                json.dumps(schema_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:16]
+            assert self.agent is not None
+            self.agent.set_mcp_schema_fingerprint(self._mcp_schema_fingerprint)
             log.info(f"Starting MCP server with {len(mcp._tool_manager._tools)} tools: {list(mcp._tool_manager._tools.keys())}")
 
     def _create_serena_agent(self, serena_config: SerenaConfig, modes: ModeSelectionDefinition | None = None) -> SerenaAgent:
         return SerenaAgent(
-            project=self.project, serena_config=serena_config, context=self.context, modes=modes, memory_log_handler=self.memory_log_handler
+            project=self.project,
+            serena_config=serena_config,
+            context=self.context,
+            modes=modes,
+            memory_log_handler=self.memory_log_handler,
+            harness_state_dir=self.harness_state_dir,
         )
 
     def _create_workspace_agent(self, project: str, workspace_id: str) -> SerenaAgent:
@@ -442,7 +484,7 @@ class SerenaMCPFactory:
         config.web_dashboard = False
         config.gui_log_window = False
         config.web_dashboard_open_on_launch = False
-        return SerenaAgent(
+        agent = SerenaAgent(
             project=project,
             serena_config=config,
             context=self.context,
@@ -450,7 +492,11 @@ class SerenaMCPFactory:
             memory_log_handler=self.memory_log_handler,
             workspace_id=workspace_id,
             workspace_registry=self._workspace_registry,
+            harness_state_dir=self.harness_state_dir,
         )
+        if self._mcp_schema_fingerprint is not None:
+            agent.set_mcp_schema_fingerprint(self._mcp_schema_fingerprint)
+        return agent
 
     def _create_default_serena_config(self) -> SerenaConfig:
         return SerenaConfig.from_config_file()
@@ -509,7 +555,12 @@ class SerenaMCPFactory:
             self._mode_selection_def = mode_selection_def
             self.agent = self._create_serena_agent(config, mode_selection_def)
             if self.workspace_mode.is_multi:
-                self._workspace_registry = WorkspaceRegistry(self._create_workspace_agent)
+                self._workspace_registry = WorkspaceRegistry(
+                    self._create_workspace_agent,
+                    ttl_seconds=self.workspace_ttl_seconds,
+                    max_workspaces=self.max_workspaces,
+                    allow_shared_worktree=self.allow_shared_worktree,
+                )
                 self.agent.set_workspace_registry(self._workspace_registry)
 
         except Exception as e:

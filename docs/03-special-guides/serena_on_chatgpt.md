@@ -1,7 +1,7 @@
 
-# Connecting Serena MCP Server to ChatGPT via MCPO & Cloudflare Tunnel
+# Connecting Serena MCP Server to ChatGPT via Remote MCP
 
-This guide explains how to expose a **locally running Serena MCP server** (powered by MCPO) to the internet using **Cloudflare Tunnel**, and how to connect it to **ChatGPT as a Custom GPT with tool access**.
+This guide explains how to expose Serena's native streamable-HTTP MCP endpoint through a Cloudflare Tunnel and connect it to ChatGPT.
 
 Once configured, ChatGPT becomes a powerful **coding agent** with direct access to your codebase, shell, and file system — so **read the security notes carefully**.
 
@@ -11,33 +11,42 @@ Once configured, ChatGPT becomes a powerful **coding agent** with direct access 
 Make sure you have [uv](https://docs.astral.sh/uv/getting-started/installation/) 
 and [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) installed.
 
-## 1. Start the Serena MCP Server via MCPO
+## 1. Start the Serena MCP Server
 
-Run the following command to launch Serena as http server (assuming port 8000):
+For one ChatGPT chat at a time, start the server in switchable single-workspace mode:
 
 ```bash
-uvx mcpo --port 8000 --api-key <YOUR_SECRET_KEY> -- \
-  serena start-mcp-server --context chatgpt --project $(pwd)
+uv run serena start-mcp-server \
+  --transport streamable-http \
+  --host 0.0.0.0 \
+  --port 9121 \
+  --project "$(pwd)" \
+  --context chatgpt
 ```
 
-- `--api-key` is required to secure the server.
-- `--project` should point to the root of your codebase.
+`--project` selects only the initial project. `activate_project` may switch the server to another project later.
 
-You can also use other options, and you don't have to pass `--project` if you want to work on multiple projects
-or want to activate it later. See 
+For independent parallel ChatGPT chats, use multi-workspace mode:
 
-```shell
-serena start-mcp-server --help
+```bash
+uv run serena start-mcp-server \
+  --transport streamable-http \
+  --host 0.0.0.0 \
+  --port 9121 \
+  --context chatgpt \
+  --workspace-mode multi
 ```
 
----
+Each chat calls `open_workspace` and keeps its returned `workspace_id`. Parallel edits to the same repository require separate Git worktree paths; sharing one working tree is rejected by default.
+
+Harness runtime state is stored outside repositories under the user cache. Use `--state-dir PATH` to override it. Multi-workspace resource controls are available through `--workspace-ttl-seconds` and `--max-workspaces`.
 
 ## 2. Expose the Server Using Cloudflare Tunnel
 
 Run:
 
 ```bash
-cloudflared tunnel --url http://localhost:8000
+cloudflared tunnel --url http://localhost:9121
 ```
 
 This will give you a **public HTTPS URL** like:
@@ -46,27 +55,19 @@ This will give you a **public HTTPS URL** like:
 https://serena-agent-tunnel.trycloudflare.com
 ```
 
-Your server is now securely exposed to the internet.
+Your server is now publicly reachable through HTTPS; authentication remains a separate deployment concern.
 
 ---
 
-## 3. Connect It to ChatGPT (Custom GPT)
+## 3. Connect It to ChatGPT
 
-### Steps:
+Add the public MCP endpoint as a remote MCP-backed ChatGPT plugin action:
 
-1. Go to [ChatGPT → Explore GPTs → Create](https://chat.openai.com/gpts/editor)
-2. During setup, click **“Add APIs”**
-3. Set up **API Key authentication** with the auth type as **Bearer** and enter the api key you used to start the MCPO server.
-4. In the **Schema** section, click on **import from URL** and paste `<cloudflared_url>/openapi.json` with the URL you got from the previous step.
-5. Add the following line to the top of the imported JSON schema:
-    ```
-     "servers": ["url": "<cloudflared_url>"],
-    ```
-   **Important**: don't include a trailing slash at the end of the URL!
+```text
+https://your-domain.example/mcp
+```
 
-ChatGPT will read the schema and create functions automatically.
-
----
+After restarting or updating Serena, refresh the plugin actions so ChatGPT reloads the tool schemas. `get_current_config` reports an MCP schema fingerprint that helps confirm whether the client is using the current schema.
 
 ## Security Warning — Read Carefully
 
@@ -76,9 +77,10 @@ Depending on your configuration and enabled tools, Serena's MCP server may:
 
 This gives ChatGPT the same powers as a remote developer on your machine.
 
-### ⚠️ Key Rules:
-- **NEVER expose your API key**
-- **Only expose this server when needed**, and monitor its use.
+### Key Rules
+
+- Protect the public endpoint with the authentication layer used by your deployment.
+- Only expose the server when needed, and monitor its use.
 
 In your project’s `.serena/project.yml` or global config, you can disable tools like:
 

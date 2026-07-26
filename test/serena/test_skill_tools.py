@@ -1,6 +1,15 @@
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
-from serena.tools.skill_tools import discover_skills, missing_tool_dependencies, render_skills_summary, skill_roots
+from serena.tools.skill_tools import (
+    DiscoverSkillsTool,
+    ReadSkillTool,
+    discover_skills,
+    missing_tool_dependencies,
+    render_skills_summary,
+    skill_roots,
+)
 from serena.tools.tools_base import ToolRegistry
 
 
@@ -52,6 +61,26 @@ def test_safe_file_tools_are_registered() -> None:
 
     assert "create_directory" in names
     assert "create_or_replace_file" in names
+
+
+def test_skill_tools_use_active_tools_and_enforce_explicit_invocation(tmp_path: Path) -> None:
+    project_root = tmp_path / "workspace"
+    skill_path = project_root / ".agents" / "skills" / "frontend-ui" / "SKILL.md"
+    _write_skill(skill_path)
+    _write_openai_yaml(skill_path.parent)
+    project = SimpleNamespace(project_root=str(project_root))
+    agent = SimpleNamespace(
+        get_active_project_or_raise=lambda: project,
+        get_active_tool_names=lambda: ["read_file"],
+    )
+
+    discovery = json.loads(DiscoverSkillsTool(agent).apply())
+    implicit_read = json.loads(ReadSkillTool(agent).apply("frontend-ui"))
+    explicit_read = json.loads(ReadSkillTool(agent).apply("frontend-ui", explicit_invocation=True))
+
+    assert discovery["dependency_report"]["frontend-ui"]["missing_tools"] == ["missing_tool"]
+    assert implicit_read["error"] == "skill requires explicit invocation: frontend-ui"
+    assert "Use the design system." in explicit_read["contents"]
 
 
 def test_discovers_repo_agents_skills_for_focus_path(tmp_path: Path) -> None:

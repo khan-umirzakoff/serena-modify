@@ -57,11 +57,14 @@ Skills disabled through `[[skills.config]]` entries in the active Codex `config.
 
 Before using a skill, an agent must call `read_skill` for the skill name or instruction path. This mirrors Codex progressive disclosure and prevents skill bodies from flooding the initial context.
 
+Skills with `policy.allow_implicit_invocation: false` are explicit-only. `read_skill` requires
+`explicit_invocation=true` for them, and agents may set it only when the user explicitly names or selects the skill.
+
 ## Safety
 
 Skill scripts and resources are discoverable but not executed automatically. Agents should inspect local resources before relying on them and should not run scripts unless the skill policy allows scripts and the script has been inspected.
 
-Missing tool dependencies are surfaced in `dependency_report`. Missing MCP server dependencies are reported as declared-only metadata until explicit MCP server availability integration is added.
+Missing active-tool dependencies are surfaced in `dependency_report`. Missing MCP server dependencies are reported as declared-only metadata until explicit MCP server availability integration is added.
 
 ## Safety-friendly file operations
 

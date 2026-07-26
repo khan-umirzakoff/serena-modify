@@ -5,6 +5,7 @@ Tools supporting the general workflow of the agent
 import json
 import os
 import platform
+import re
 import shlex
 import subprocess
 import tomllib
@@ -13,9 +14,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from serena.harness_state import HarnessStateStore
 from serena.tools import Tool, ToolMarkerCanEdit, ToolMarkerDoesNotRequireActiveProject, ToolMarkerOptional, WriteMemoryTool
 from serena.tools.skill_tools import discover_skills, render_skills_summary, skill_dependency_reports
 from serena.tools.task_catalog import VALIDATION_KINDS, TaskCatalog, ValidationHints, discover_task_catalog, infer_validation_hints
+from serena.util.project_scope import resolve_git_scope_root
 
 
 @dataclass(frozen=True)
@@ -90,13 +93,14 @@ DEFAULT_REVIEW_DIFF_MAX_CHARS = 60_000
 DEFAULT_PROJECT_DOC_MAX_BYTES = 32 * 1024
 
 
-def _serena_state_path(project_root: Path, filename: str, workspace_id: str | None = None) -> Path:
-    state_dir = project_root / ".serena"
-    if workspace_id is not None:
-        if not workspace_id.isalnum():
-            raise ValueError("workspace_id must be alphanumeric")
-        state_dir = state_dir / "task-sessions" / workspace_id
-    return state_dir / filename
+def _serena_state_path(
+    project_root: Path,
+    filename: str,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> Path:
+    """External runtime-state path for one project and workspace."""
+    return (state_store or HarnessStateStore.create()).path(project_root, filename, workspace_id)
 
 
 def _utc_now() -> str:
@@ -110,26 +114,47 @@ def _parse_time(value: str) -> datetime | None:
         return None
 
 
-def _goal_state_path(project_root: Path, workspace_id: str | None = None) -> Path:
-    return _serena_state_path(project_root, GOAL_STATE_FILENAME, workspace_id)
+def _goal_state_path(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> Path:
+    return _serena_state_path(project_root, GOAL_STATE_FILENAME, workspace_id, state_store)
 
 
-def _plan_state_path(project_root: Path, workspace_id: str | None = None) -> Path:
-    return _serena_state_path(project_root, PLAN_STATE_FILENAME, workspace_id)
+def _plan_state_path(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> Path:
+    return _serena_state_path(project_root, PLAN_STATE_FILENAME, workspace_id, state_store)
 
 
-def _coding_task_context_path(project_root: Path, workspace_id: str | None = None) -> Path:
-    return _serena_state_path(project_root, CODING_TASK_CONTEXT_FILENAME, workspace_id)
+def _coding_task_context_path(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> Path:
+    return _serena_state_path(project_root, CODING_TASK_CONTEXT_FILENAME, workspace_id, state_store)
 
 
-def _save_coding_task_context(project_root: Path, state: dict[str, Any], workspace_id: str | None = None) -> None:
-    path = _coding_task_context_path(project_root, workspace_id)
+def _save_coding_task_context(
+    project_root: Path,
+    state: dict[str, Any],
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> None:
+    path = _coding_task_context_path(project_root, workspace_id, state_store)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _load_coding_task_context(project_root: Path, workspace_id: str | None = None) -> dict[str, Any] | None:
-    path = _coding_task_context_path(project_root, workspace_id)
+def _load_coding_task_context(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> dict[str, Any] | None:
+    path = _coding_task_context_path(project_root, workspace_id, state_store)
     if not path.is_file():
         return None
     try:
@@ -146,8 +171,12 @@ def _validate_goal_objective(objective: str) -> None:
         raise ValueError(f"goal objective must be at most {MAX_GOAL_OBJECTIVE_CHARS} characters")
 
 
-def _load_goal_state(project_root: Path, workspace_id: str | None = None) -> dict[str, Any] | None:
-    path = _goal_state_path(project_root, workspace_id)
+def _load_goal_state(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> dict[str, Any] | None:
+    path = _goal_state_path(project_root, workspace_id, state_store)
     if not path.is_file():
         return None
     try:
@@ -157,14 +186,23 @@ def _load_goal_state(project_root: Path, workspace_id: str | None = None) -> dic
     return state if isinstance(state, dict) else None
 
 
-def _save_goal_state(project_root: Path, state: dict[str, Any], workspace_id: str | None = None) -> None:
-    path = _goal_state_path(project_root, workspace_id)
+def _save_goal_state(
+    project_root: Path,
+    state: dict[str, Any],
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> None:
+    path = _goal_state_path(project_root, workspace_id, state_store)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _require_goal_state(project_root: Path, workspace_id: str | None = None) -> dict[str, Any]:
-    state = _load_goal_state(project_root, workspace_id)
+def _require_goal_state(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> dict[str, Any]:
+    state = _load_goal_state(project_root, workspace_id, state_store)
     if state is None:
         raise ValueError("No Serena goal exists for this project. Call create_goal first.")
     return state
@@ -209,25 +247,33 @@ def _goal_guidance(goal: dict[str, Any] | None) -> list[str] | None:
     ]
 
 
-def _goal_public_state(project_root: Path, workspace_id: str | None = None) -> dict[str, Any] | None:
-    state = _load_goal_state(project_root, workspace_id)
+def _goal_public_state(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> dict[str, Any] | None:
+    state = _load_goal_state(project_root, workspace_id, state_store)
     if state is None:
         return None
     state = dict(state)
-    state["state_path"] = str(_goal_state_path(project_root, workspace_id))
+    state["state_path"] = str(_goal_state_path(project_root, workspace_id, state_store))
     state["time_used_seconds"] = _goal_time_used_seconds(state)
     state["remaining_tokens"] = _goal_remaining_tokens(state)
     return state
 
 
-def _compact_goal_public_state(project_root: Path, workspace_id: str | None = None) -> dict[str, Any] | None:
+def _compact_goal_public_state(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> dict[str, Any] | None:
     """
     Return the active goal fields useful in a coding task snapshot.
 
     :param project_root: active project root
     :return: compact goal state, or None if no goal is active
     """
-    state = _goal_public_state(project_root, workspace_id)
+    state = _goal_public_state(project_root, workspace_id, state_store)
     if state is None:
         return None
     return {
@@ -270,14 +316,23 @@ def _truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
     return text[:half] + f"\n...[omitted {omitted} chars from middle]...\n" + text[-tail:], True
 
 
-def _save_plan_state(project_root: Path, state: dict[str, Any], workspace_id: str | None = None) -> None:
-    path = _plan_state_path(project_root, workspace_id)
+def _save_plan_state(
+    project_root: Path,
+    state: dict[str, Any],
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> None:
+    path = _plan_state_path(project_root, workspace_id, state_store)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _load_plan_state(project_root: Path, workspace_id: str | None = None) -> dict[str, Any] | None:
-    path = _plan_state_path(project_root, workspace_id)
+def _load_plan_state(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> dict[str, Any] | None:
+    path = _plan_state_path(project_root, workspace_id, state_store)
     if not path.is_file():
         return None
     try:
@@ -287,23 +342,31 @@ def _load_plan_state(project_root: Path, workspace_id: str | None = None) -> dic
     return state if isinstance(state, dict) else None
 
 
-def _plan_public_state(project_root: Path, workspace_id: str | None = None) -> dict[str, Any] | None:
-    state = _load_plan_state(project_root, workspace_id)
+def _plan_public_state(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> dict[str, Any] | None:
+    state = _load_plan_state(project_root, workspace_id, state_store)
     if state is None:
         return None
     state = dict(state)
-    state["state_path"] = str(_plan_state_path(project_root, workspace_id))
+    state["state_path"] = str(_plan_state_path(project_root, workspace_id, state_store))
     return state
 
 
-def _compact_plan_public_state(project_root: Path, workspace_id: str | None = None) -> dict[str, Any] | None:
+def _compact_plan_public_state(
+    project_root: Path,
+    workspace_id: str | None = None,
+    state_store: HarnessStateStore | None = None,
+) -> dict[str, Any] | None:
     """
     Return active plan fields useful in a coding task snapshot.
 
     :param project_root: active project root
     :return: compact plan state, or None if no plan is active
     """
-    state = _plan_public_state(project_root, workspace_id)
+    state = _plan_public_state(project_root, workspace_id, state_store)
     if state is None:
         return None
     return {
@@ -353,26 +416,7 @@ def _format_plan_markdown(plan: list[dict[str, Any]]) -> str:
 
 def _resolve_git_root(project_root: Path, focus_dir: Path) -> Path:
     """Nearest Git repository root for a scoped coding task."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=focus_dir,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return project_root
-
-    git_root_text = result.stdout.strip()
-    if result.returncode != 0 or not git_root_text:
-        return project_root
-
-    git_root = Path(git_root_text).resolve()
-    if git_root == project_root or project_root in git_root.parents:
-        return git_root
-    return project_root
+    return resolve_git_scope_root(project_root, focus_dir)
 
 
 def _run_git_text(project_root: Path, command: list[str], max_chars: int = 12000) -> dict[str, Any]:
@@ -974,7 +1018,60 @@ def _parse_validation_diagnostics(output: str, max_items: int = 20) -> list[dict
     """Parse common validation output into compact diagnostics."""
     diagnostics: list[dict[str, Any]] = []
     for line in output.splitlines():
-        if line.startswith("FAILED "):
+        flutter_machine = re.match(
+            r"^(ERROR|WARNING|INFO)\|[^|]*\|[^|]*\|([^|]+)\|(\d+)\|(\d+)\|\d+\|(.+)$",
+            line,
+        )
+        flutter_human = re.match(
+            r"^\s*(error|warning|info)\s+[•-]\s+(.+?)\s+[•-]\s+(.+?):(\d+):(\d+)\s+[•-]\s+(\S+)\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        dart_human = re.match(
+            r"^\s*(error|warning|info)\s+-\s+(.+?):(\d+):(\d+)\s+-\s+(.+?)(?:\s+-\s+(\S+))?\s*$",
+            line,
+            flags=re.IGNORECASE,
+        )
+
+        if flutter_machine is not None:
+            severity, path, line_number, column, message = flutter_machine.groups()
+            diagnostics.append(
+                {
+                    "tool": "dart",
+                    "severity": severity.lower(),
+                    "path": path,
+                    "line": int(line_number),
+                    "column": int(column),
+                    "message": message.strip(),
+                }
+            )
+        elif flutter_human is not None:
+            severity, message, path, line_number, column, code = flutter_human.groups()
+            diagnostics.append(
+                {
+                    "tool": "flutter",
+                    "severity": severity.lower(),
+                    "path": path,
+                    "line": int(line_number),
+                    "column": int(column),
+                    "code": code,
+                    "message": message.strip(),
+                }
+            )
+        elif dart_human is not None:
+            severity, path, line_number, column, message, code = dart_human.groups()
+            diagnostics.append(
+                {
+                    "tool": "dart",
+                    "severity": severity.lower(),
+                    "path": path,
+                    "line": int(line_number),
+                    "column": int(column),
+                    "code": code,
+                    "message": message.strip(),
+                }
+            )
+        elif line.startswith("FAILED "):
             parts = line.split(" ", 2)
             diagnostics.append({"tool": "pytest", "path": parts[1] if len(parts) > 1 else "", "message": line})
         else:
@@ -1463,6 +1560,7 @@ class PrepareCodingTaskTool(Tool):
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
         workspace_id = self.agent.get_workspace_id()
+        state_store = self.agent.get_harness_state_store()
 
         focus_dir = _resolve_coding_task_focus_dir(
             project_root,
@@ -1471,11 +1569,12 @@ class PrepareCodingTaskTool(Tool):
             workspace_id=workspace_id,
         )
         focus_path = _relative_path(focus_dir, project_root)
+        git_root = _resolve_git_root(project_root, focus_dir)
         instruction_settings = _project_instruction_settings()
         instruction_budget = instruction_settings.max_bytes if max_instruction_bytes is None else max_instruction_bytes
 
         instruction_documents = _load_instruction_documents(
-            project_root=project_root,
+            project_root=git_root,
             focus_dir=focus_dir,
             max_total_bytes=instruction_budget,
             settings=instruction_settings,
@@ -1484,11 +1583,10 @@ class PrepareCodingTaskTool(Tool):
         context, modes, active_tools = _active_serena_state(self.agent)
         full_task_catalog = discover_task_catalog(project_root, relative_path=relative_path)
         task_catalog = full_task_catalog.filtered(include_internal=False, max_tasks=15)
-        skills_outcome = discover_skills(project_root, focus_dir)
+        skills_outcome = discover_skills(git_root, focus_dir)
         skills_summary = render_skills_summary(skills_outcome.skills)
         skill_dependency_report = skill_dependency_reports(skills_outcome.skills, set(self.agent.get_active_tool_names()))
 
-        git_root = _resolve_git_root(project_root, focus_dir)
         now = _utc_now()
         _save_coding_task_context(
             project_root,
@@ -1502,6 +1600,7 @@ class PrepareCodingTaskTool(Tool):
                 "updated_at": now,
             },
             workspace_id,
+            state_store,
         )
 
         snapshot = CodingTaskSnapshot(
@@ -1517,8 +1616,8 @@ class PrepareCodingTaskTool(Tool):
             validation_hints=_compact_validation_hints(task_catalog),
             task_catalog_summary=full_task_catalog.summary(),
             task_catalog=_task_catalog_agent_view(full_task_catalog, task_catalog, include_details=False),
-            active_goal=_compact_goal_public_state(project_root, workspace_id),
-            active_plan=_compact_plan_public_state(project_root, workspace_id),
+            active_goal=_compact_goal_public_state(project_root, workspace_id, state_store),
+            active_plan=_compact_plan_public_state(project_root, workspace_id, state_store),
             available_skills=[skill.to_public_dict() for skill in skills_outcome.skills],
             skills_summary=skills_summary,
             skill_dependency_report=skill_dependency_report,
@@ -1642,7 +1741,8 @@ class FinalizeCodingTaskTool(Tool):
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
         workspace_id = self.agent.get_workspace_id()
-        context = _load_coding_task_context(project_root, workspace_id) if relative_path is None else None
+        state_store = self.agent.get_harness_state_store()
+        context = _load_coding_task_context(project_root, workspace_id, state_store) if relative_path is None else None
         resolved_relative_path = relative_path or str((context or {}).get("focus_path") or ".")
         focus_dir = _resolve_focus_dir(project_root, resolved_relative_path)
         focus_path = _relative_path(focus_dir, project_root)
@@ -1652,8 +1752,8 @@ class FinalizeCodingTaskTool(Tool):
             "project_root": str(project_root),
             "focus_path": focus_path,
             "git_root": str(git_root),
-            "active_goal": _goal_public_state(project_root, workspace_id),
-            "active_plan": _plan_public_state(project_root, workspace_id),
+            "active_goal": _goal_public_state(project_root, workspace_id, state_store),
+            "active_plan": _plan_public_state(project_root, workspace_id, state_store),
             "git_status": asdict(_run_git_snapshot(git_root, ["status", "--short"])),
             "git_diff_stat": asdict(_run_git_snapshot(git_root, ["diff", "--stat"])),
             "git_diff_cached_stat": asdict(_run_git_snapshot(git_root, ["diff", "--cached", "--stat"])),
@@ -1981,13 +2081,14 @@ class UpdatePlanTool(Tool):
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
         workspace_id = self.agent.get_workspace_id()
+        state_store = self.agent.get_harness_state_store()
         state = {
             "updated_at": _utc_now(),
             "explanation": explanation.strip() if isinstance(explanation, str) and explanation.strip() else None,
             "plan": normalized_plan,
-            "state_path": str(_plan_state_path(project_root, workspace_id)),
+            "state_path": str(_plan_state_path(project_root, workspace_id, state_store)),
         }
-        _save_plan_state(project_root, state, workspace_id)
+        _save_plan_state(project_root, state, workspace_id, state_store)
         markdown = _format_plan_markdown(normalized_plan)
         return json.dumps(
             {
@@ -2099,7 +2200,8 @@ class GetGoalTool(Tool):
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
         workspace_id = self.agent.get_workspace_id()
-        return json.dumps(_goal_response(_goal_public_state(project_root, workspace_id)), ensure_ascii=False, indent=2)
+        state_store = self.agent.get_harness_state_store()
+        return json.dumps(_goal_response(_goal_public_state(project_root, workspace_id, state_store)), ensure_ascii=False, indent=2)
 
 
 class CreateGoalTool(Tool):
@@ -2123,7 +2225,8 @@ class CreateGoalTool(Tool):
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
         workspace_id = self.agent.get_workspace_id()
-        existing = _load_goal_state(project_root, workspace_id)
+        state_store = self.agent.get_harness_state_store()
+        existing = _load_goal_state(project_root, workspace_id, state_store)
         if existing is not None and existing.get("status") != "complete":
             raise ValueError("cannot create a new goal because this project has an unfinished goal; complete the existing goal first")
 
@@ -2141,8 +2244,8 @@ class CreateGoalTool(Tool):
             "remaining_risks": None,
             "project_root": str(project_root),
         }
-        _save_goal_state(project_root, state, workspace_id)
-        return json.dumps(_goal_response(_goal_public_state(project_root, workspace_id)), ensure_ascii=False, indent=2)
+        _save_goal_state(project_root, state, workspace_id, state_store)
+        return json.dumps(_goal_response(_goal_public_state(project_root, workspace_id, state_store)), ensure_ascii=False, indent=2)
 
 
 class UpdateGoalTool(Tool):
@@ -2167,15 +2270,19 @@ class UpdateGoalTool(Tool):
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
         workspace_id = self.agent.get_workspace_id()
-        state = _require_goal_state(project_root, workspace_id)
+        state_store = self.agent.get_harness_state_store()
+        state = _require_goal_state(project_root, workspace_id, state_store)
         if state.get("status") == "complete":
             raise ValueError("cannot update goal because it is already complete")
         state["time_used_seconds"] = _goal_time_used_seconds(state)
         state["status"] = normalized_status
         state["updated_at"] = _utc_now()
-        _save_goal_state(project_root, state, workspace_id)
+        _save_goal_state(project_root, state, workspace_id, state_store)
         return json.dumps(
-            _goal_response(_goal_public_state(project_root, workspace_id), include_completion_report=normalized_status == "complete"),
+            _goal_response(
+                _goal_public_state(project_root, workspace_id, state_store),
+                include_completion_report=normalized_status == "complete",
+            ),
             ensure_ascii=False,
             indent=2,
         )
@@ -2203,7 +2310,8 @@ class RecordGoalProgressTool(Tool):
         active_project = self.agent.get_active_project_or_raise()
         project_root = Path(active_project.project_root).resolve()
         workspace_id = self.agent.get_workspace_id()
-        state = _require_goal_state(project_root, workspace_id)
+        state_store = self.agent.get_harness_state_store()
+        state = _require_goal_state(project_root, workspace_id, state_store)
         _append_goal_note(state, note)
         if validation_results is not None:
             state["validation_results"] = validation_results
@@ -2211,8 +2319,8 @@ class RecordGoalProgressTool(Tool):
             state["remaining_risks"] = remaining_risks
         state["time_used_seconds"] = _goal_time_used_seconds(state)
         state["updated_at"] = _utc_now()
-        _save_goal_state(project_root, state, workspace_id)
-        return json.dumps(_goal_response(_goal_public_state(project_root, workspace_id)), ensure_ascii=False, indent=2)
+        _save_goal_state(project_root, state, workspace_id, state_store)
+        return json.dumps(_goal_response(_goal_public_state(project_root, workspace_id, state_store)), ensure_ascii=False, indent=2)
 
 
 class OnboardingTool(Tool):
