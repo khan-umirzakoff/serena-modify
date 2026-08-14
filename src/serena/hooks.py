@@ -31,7 +31,7 @@ class HookClient(Enum):
 class Hook(ABC):
     def __init__(self, client: HookClient):
         raw = sys.stdin.read()
-        input_data = json.loads(raw)
+        input_data = json.loads(raw, strict=False)
         self._input_data = input_data
         self._client = client
 
@@ -323,6 +323,7 @@ class PreToolUseRemindAboutSymbolicToolsHook(PreToolUseHook):
             ".lua",
             ".m",
             ".matlab",
+            ".nf",
             ".php",
             ".proto",
             ".ps1",
